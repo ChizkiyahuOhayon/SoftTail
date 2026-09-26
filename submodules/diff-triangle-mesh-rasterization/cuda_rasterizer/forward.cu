@@ -1,0 +1,1124 @@
+/*
+ * The original code is under the following copyright:
+ * Copyright (C) 2023, Inria
+ * GRAPHDECO research group, https://team.inria.fr/graphdeco
+ * All rights reserved.
+ *
+ * This software is free for non-commercial, research and evaluation use 
+ * under the terms of the LICENSE_GS.md file.
+ *
+ * For inquiries contact  george.drettakis@inria.fr
+ * 
+ * The modifications of the code are under the following copyright:
+ * Copyright (C) 2024, University of Liege, KAUST and University of Oxford
+ * TELIM research group, http://www.telecom.ulg.ac.be/
+ * IVUL research group, https://ivul.kaust.edu.sa/
+ * VGG research group, https://www.robots.ox.ac.uk/~vgg/
+ * All rights reserved.
+ * The modifications are under the LICENSE.md file.
+ *
+ * For inquiries contact jan.held@uliege.be
+ */
+
+ #include "forward.h"
+ #include "auxiliary.h"
+#include "texel.h"
+ #include <cooperative_groups.h>
+ #include <cooperative_groups/reduce.h>
+ namespace cg = cooperative_groups;
+ 
+ 
+ 
+ // Forward method for converting the input spherical harmonics
+ // coefficients of each Triangle to a simple RGB color.
+ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3 means, glm::vec3 campos, const float* shs, bool* clamped)
+ {
+	 // The implementation is loosely based on code for 
+	 // "Differentiable Point-Based Radiance Fields for 
+	 // Efficient View Synthesis" by Zhang et al. (2022)
+	 glm::vec3 pos = means;
+	 glm::vec3 dir = pos - campos;
+	 dir = dir / glm::length(dir);
+ 
+	 glm::vec3* sh = ((glm::vec3*)shs) + idx * max_coeffs;
+	 glm::vec3 result = SH_C0 * sh[0];
+ 
+	 if (deg > 0)
+	 {
+		 float x = dir.x;
+		 float y = dir.y;
+		 float z = dir.z;
+		 result = result - SH_C1 * y * sh[1] + SH_C1 * z * sh[2] - SH_C1 * x * sh[3];
+ 
+		 if (deg > 1)
+		 {
+			 float xx = x * x, yy = y * y, zz = z * z;
+			 float xy = x * y, yz = y * z, xz = x * z;
+			 result = result +
+				 SH_C2[0] * xy * sh[4] +
+				 SH_C2[1] * yz * sh[5] +
+				 SH_C2[2] * (2.0f * zz - xx - yy) * sh[6] +
+				 SH_C2[3] * xz * sh[7] +
+				 SH_C2[4] * (xx - yy) * sh[8];
+ 
+			 if (deg > 2)
+			 {
+				 result = result +
+					 SH_C3[0] * y * (3.0f * xx - yy) * sh[9] +
+					 SH_C3[1] * xy * z * sh[10] +
+					 SH_C3[2] * y * (4.0f * zz - xx - yy) * sh[11] +
+					 SH_C3[3] * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * sh[12] +
+					 SH_C3[4] * x * (4.0f * zz - xx - yy) * sh[13] +
+					 SH_C3[5] * z * (xx - yy) * sh[14] +
+					 SH_C3[6] * x * (xx - 3.0f * yy) * sh[15];
+			 }
+		 }
+	 }
+	 result += 0.5f;
+
+	 // RGB colors are clamped to positive values. If values are
+	 // clamped, we need to keep track of this for the backward pass.
+	 clamped[3 * idx + 0] = (result.x < 0);
+	 clamped[3 * idx + 1] = (result.y < 0);
+	 clamped[3 * idx + 2] = (result.z < 0);
+	 return glm::max(result, 0.0f);
+ }
+ 
+__global__ void computeVertexColorsCUDA(
+    int V, int D, int M,
+    const float* vertices,
+    const float* shs,
+    bool* clamped,
+    float* rgb,
+	float* vertex_depth, 
+	const float* viewmatrix,
+    const glm::vec3* cam_pos)
+{
+    auto idx = cg::this_grid().thread_rank();
+    if (idx >= V)
+        return;
+
+    float3 vertex = make_float3(
+        vertices[3 * idx],
+        vertices[3 * idx + 1],
+        vertices[3 * idx + 2]
+    );
+
+    glm::vec3 result = computeColorFromSH(
+        idx, D, M,
+        glm::vec3(vertex.x, vertex.y, vertex.z),
+        *cam_pos,
+        shs,
+        clamped
+    );
+
+    rgb[3 * idx + 0] = result.x;
+    rgb[3 * idx + 1] = result.y;
+    rgb[3 * idx + 2] = result.z;
+
+	float3 p_view = transformPoint4x3(vertex, viewmatrix);
+	// instead of the z coordinate as depth, lets take the distance to the camera
+	//vertex_depth[idx] = __fsqrt_rn(p_view.x * p_view.x + p_view.y * p_view.y + p_view.z * p_view.z);
+	vertex_depth[idx] = p_view.z;
+}
+
+__global__ void computeVertexSH1FactorsCUDA(
+    int V,
+    const float* vertices,
+    const glm::vec3* cam_pos,
+    float* edge_sh1)
+{
+    auto idx = cg::this_grid().thread_rank();
+    if (idx >= V)
+        return;
+
+    glm::vec3 direction(
+        vertices[3 * idx] - cam_pos->x,
+        vertices[3 * idx + 1] - cam_pos->y,
+        vertices[3 * idx + 2] - cam_pos->z);
+    direction /= glm::length(direction);
+    edge_sh1[3 * idx + 0] = -SH_C1 * direction.y;
+    edge_sh1[3 * idx + 1] =  SH_C1 * direction.z;
+    edge_sh1[3 * idx + 2] = -SH_C1 * direction.x;
+}
+
+
+ 
+ // Perform initial steps for each Triangle prior to rasterization.
+ template<int C>
+ __global__ void preprocessCUDA(int P, int D, int M,
+	 const float* vertices,
+	 const int* triangles_indices,
+	 const float* vertex_weights,
+	 const int* window_source,
+	 const int* donor_indices,
+	 const int donor_mode,
+	 float2* donor_normals,
+	 float* donor_offsets,
+	 float2* donor_p_image,
+	 const float sigma,
+	 float* scaling,
+	 const float* shs,
+	 bool* clamped,
+	 const float* colors_precomp,
+	 const float* viewmatrix,
+	 const float* projmatrix,
+	 const glm::vec3* cam_pos,
+	 const int W, int H,
+	 const float tan_fovx, float tan_fovy,
+	 const float focal_x, float focal_y,
+	 int* radii,
+	 float2* normals,
+	 float* offsets,
+	 float* p_w,
+	 float2* p_image,
+	 int* indices,
+	 float2* points_xy_image,
+	 float* depths,
+	 float4* conic_opacity,
+	 float2* phi_center,
+	 uint2* rect_min,
+	 uint2* rect_max,
+	 const dim3 grid,
+	 uint32_t* tiles_touched,
+	 bool prefiltered,
+	 const bool opacity_field,
+	 const bool elastic_window)
+ {
+ 
+	 auto idx = cg::this_grid().thread_rank();
+	 if (idx >= P)
+		 return;
+	
+
+	 // Initialize radius and touched tiles to 0. If this isn't changed,
+	 // this Triangle will not be processed further.
+
+	 const int cumsum_for_triangle = 3 * idx;
+	
+	 radii[idx] = 0;
+	 tiles_touched[idx] = 0;
+	 scaling[idx] = 0.0f;
+
+	 float stopping_influence = 0.01f;
+ 
+	 float3 center_triangle = {0.0f, 0.0f, 0.0f};
+	 float min_weight = INFINITY;
+	 float max_weight = -INFINITY;
+	 for (int i = 0; i < 3; i++) {
+		indices[cumsum_for_triangle + i] = i;
+
+		int vertex_index = triangles_indices[cumsum_for_triangle + i];
+
+		center_triangle.x += vertices[3 * vertex_index];
+		center_triangle.y += vertices[3 * vertex_index + 1];
+		center_triangle.z += vertices[3 * vertex_index + 2];
+
+		float weight = vertex_weights[vertex_index];
+
+		if (weight < min_weight) {
+			min_weight = weight;
+		}
+		max_weight = fmaxf(max_weight, weight);
+	 }
+ 
+	 center_triangle.x /= 3;
+	 center_triangle.y /= 3;
+	 center_triangle.z /= 3;
+
+	 // RITS window donor: a refined face may inherit the per-face scalar
+	 // semantics of the triangle it subdivides (window domain and inradius,
+	 // size culling, frustum reference, depth sort key, min-vertex opacity),
+	 // keeping only its pixel support local. The donor's 2D quantities are
+	 // recomputed here with the exact formulas used below for the face itself;
+	 // the baseline path is left untouched so that runs without donors remain
+	 // bit-identical to the unmodified rasterizer.
+	 const bool has_donor = (window_source != nullptr) && (donor_mode != 0) && (window_source[idx] >= 0);
+	 const bool donor_win = has_donor && (donor_mode & FORWARD::DONOR_WINDOW);
+	 const bool donor_op = has_donor && (donor_mode & FORWARD::DONOR_OPACITY);
+	 const bool donor_app = has_donor && (donor_mode & FORWARD::DONOR_APPEARANCE);
+
+	 float3 donor_center = {0.0f, 0.0f, 0.0f};
+	 float donor_min_weight = INFINITY;
+	 float donor_dist = 0.0f;
+	 bool donor_cull = false;
+	 if (has_donor) {
+		 const int donor_base = 3 * window_source[idx];
+		 float3 donor_p[3];
+		 for (int i = 0; i < 3; i++) {
+			 int vertex_index = donor_indices[donor_base + i];
+			 donor_p[i] = make_float3(
+				vertices[3 * vertex_index + 0],
+				vertices[3 * vertex_index + 1],
+				vertices[3 * vertex_index + 2]
+			 );
+			 donor_center.x += donor_p[i].x;
+			 donor_center.y += donor_p[i].y;
+			 donor_center.z += donor_p[i].z;
+			 float weight = vertex_weights[vertex_index];
+			 if (weight < donor_min_weight) {
+				 donor_min_weight = weight;
+			 }
+		 }
+		 donor_center.x /= 3;
+		 donor_center.y /= 3;
+		 donor_center.z /= 3;
+
+		 if (donor_win || donor_app) {
+			 float2 donor_image[3];
+			 for (int i = 0; i < 3; i++) {
+				 float4 p_hom = transformPoint4x4(donor_p[i], projmatrix);
+				 float inv_w = 1.0f / (p_hom.w + 0.0000001f);
+				 donor_image[i] = { ndc2Pix(p_hom.x * inv_w, W), ndc2Pix(p_hom.y * inv_w, H) };
+				 if (donor_app) {
+					 donor_p_image[cumsum_for_triangle + i] = donor_image[i];
+				 }
+			 }
+			 if (donor_win) {
+			 float4 p_hom_center = transformPoint4x4(donor_center, projmatrix);
+			 float p_w_center = 1.0f / (p_hom_center.w + 0.0000001f);
+			 float2 donor_center_2D = {
+				ndc2Pix(p_hom_center.x * p_w_center, W),
+				ndc2Pix(p_hom_center.y * p_w_center, H)
+			 };
+
+			 float donor_distance_points = 0.0f;
+			 for (int i = 0; i < 3; i++) {
+				 float distance = __fsqrt_rn((donor_image[i].x - donor_center_2D.x) * (donor_image[i].x - donor_center_2D.x)
+					+ (donor_image[i].y - donor_center_2D.y) * (donor_image[i].y - donor_center_2D.y));
+				 if (distance > donor_distance_points) {
+					 donor_distance_points = distance;
+				 }
+			 }
+
+			 float a = __fsqrt_rn((donor_image[1].x - donor_image[2].x) * (donor_image[1].x - donor_image[2].x) + (donor_image[1].y - donor_image[2].y) * (donor_image[1].y - donor_image[2].y));
+			 float b = __fsqrt_rn((donor_image[0].x - donor_image[2].x) * (donor_image[0].x - donor_image[2].x) + (donor_image[0].y - donor_image[2].y) * (donor_image[0].y - donor_image[2].y));
+			 float c = __fsqrt_rn((donor_image[0].x - donor_image[1].x) * (donor_image[0].x - donor_image[1].x) + (donor_image[0].y - donor_image[1].y) * (donor_image[0].y - donor_image[1].y));
+			 float sum = a + b + c;
+			 float2 donor_incenter;
+			 donor_incenter.x = (a * donor_image[0].x + b * donor_image[1].x + c * donor_image[2].x) / sum;
+			 donor_incenter.y = (a * donor_image[0].y + b * donor_image[1].y + c * donor_image[2].y) / sum;
+
+			 for (int i = 0; i < 3; i++) {
+				 float2 p1_conv = donor_image[i];
+				 float2 p2_conv = donor_image[(i + 1) % 3];
+				 float nx = p2_conv.y - p1_conv.y;
+				 float ny = -(p2_conv.x - p1_conv.x);
+				 float inv_norm = 1.0f / __fsqrt_rn(nx * nx + ny * ny);
+				 float2 normal = {nx * inv_norm, ny * inv_norm};
+				 float offset = - (normal.x * p1_conv.x + normal.y * p1_conv.y);
+				 donor_dist = normal.x * donor_incenter.x + normal.y * donor_incenter.y + offset;
+				 if (donor_dist > 0) {
+					 normal.x = -normal.x;
+					 normal.y = -normal.y;
+					 offset = -offset;
+					 donor_dist = -donor_dist;
+				 }
+				 donor_normals[cumsum_for_triangle + i] = normal;
+				 donor_offsets[cumsum_for_triangle + i] = offset;
+			 }
+			 donor_cull = (donor_distance_points > 1600 or donor_distance_points < 1 or donor_dist > -1);
+			 }
+		 }
+	 }
+	 const float eff_min_weight = donor_op ? donor_min_weight : min_weight;
+
+
+	 int vertex_index = triangles_indices[cumsum_for_triangle];
+	 float3 p0 = make_float3(
+		vertices[3 * vertex_index + 0],
+		vertices[3 * vertex_index + 1],
+		vertices[3 * vertex_index + 2]
+	 );
+	 vertex_index = triangles_indices[cumsum_for_triangle + 1];
+	 float3 p1 = make_float3(
+		vertices[3 * vertex_index + 0],
+		vertices[3 * vertex_index + 1],
+		vertices[3 * vertex_index + 2]
+	 );
+	 vertex_index = triangles_indices[cumsum_for_triangle + 2];
+	 float3 p2 = make_float3(
+		vertices[3 * vertex_index + 0],
+		vertices[3 * vertex_index + 1],
+		vertices[3 * vertex_index + 2]
+	 );
+
+ 
+	 // Perform near culling, quit if outside. A donor-window face stands and
+	 // falls with its donor's reference point, which also becomes its depth
+	 // sort key below, so siblings composite exactly where their parent did.
+	 float3 p_view_triangle;
+	 const float3 eff_center = donor_win ? donor_center : center_triangle;
+	 if (!in_frustum_triangle(idx, eff_center, viewmatrix, projmatrix, prefiltered, p_view_triangle)){
+		 return;
+	 }
+
+	 // Calculate the normal of the Triangle
+	 float3 normal_cvx = {0.0f, 0.0f, 0.0f};
+	 float3 v1 = make_float3(p1.x - p0.x, p1.y - p0.y, p1.z - p0.z);
+	 float3 v2 = make_float3(p2.x - p0.x, p2.y - p0.y, p2.z - p0.z);
+
+	 float3 cross_prod = make_float3(
+		v1.y * v2.z - v1.z * v2.y,
+		v1.z * v2.x - v1.x * v2.z,
+		v1.x * v2.y - v1.y * v2.x
+	 );
+	 cross_prod = transformVec4x3(cross_prod, viewmatrix);
+
+	 float length_cross = __fsqrt_rn(cross_prod.x*cross_prod.x + cross_prod.y*cross_prod.y + cross_prod.z*cross_prod.z);
+	 length_cross = max(length_cross, 1e-4f);
+	 cross_prod.x /= length_cross;
+	 cross_prod.y /= length_cross;
+	 cross_prod.z /= length_cross;
+	
+	 normal_cvx = cross_prod;
+	 // 2. Normalize the camera viewpoint direction
+	float length_viewpoint = __fsqrt_rn(p_view_triangle.x * p_view_triangle.x + 
+		p_view_triangle.y * p_view_triangle.y + 
+		p_view_triangle.z * p_view_triangle.z);
+	length_viewpoint = max(length_viewpoint, 1e-4f);
+
+	float3 normalized_camera_center;
+	normalized_camera_center.x = p_view_triangle.x / length_viewpoint;
+	normalized_camera_center.y = p_view_triangle.y / length_viewpoint;
+	normalized_camera_center.z = p_view_triangle.z / length_viewpoint;
+
+	// 3. Compute cosine (before flipping the normal)
+	float cos_theta = normal_cvx.x * normalized_camera_center.x +
+	normal_cvx.y * normalized_camera_center.y +
+	normal_cvx.z * normalized_camera_center.z;
+
+	// 4. Flip the normal if needed (ensure it faces the camera)
+	if (cos_theta > 0) {
+		normal_cvx.x = -normal_cvx.x;
+		normal_cvx.y = -normal_cvx.y;
+		normal_cvx.z = -normal_cvx.z;
+		cos_theta = -cos_theta; 
+	}
+	
+	const float threshold = 0.001f;
+	if (fabsf(cos_theta) < threshold) {
+		return;
+	}
+
+	// Under the per-vertex opacity field a face is transparent only where all
+	// three corners are, so it is culled on its most opaque corner instead.
+	const float cull_weight = opacity_field ? max_weight : eff_min_weight;
+	if (cull_weight < stopping_influence){
+		return;
+	}
+
+	float4 p_hom_center = transformPoint4x4(center_triangle, projmatrix);
+	float p_w_center = 1.0f / (p_hom_center.w + 0.0000001f);
+	float3 center_triangle_camera_view = { p_hom_center.x * p_w_center, p_hom_center.y * p_w_center, p_hom_center.z * p_w_center };
+	float2 center_triangle_2D = { ndc2Pix(center_triangle_camera_view.x, W), ndc2Pix(center_triangle_camera_view.y, H) };
+
+	float distance = 0.0f;
+	float distance_points = 0.0f;
+
+	for (int i = 0; i < 3; i++) {
+		int index_new = triangles_indices[cumsum_for_triangle + i];
+		float3 triangle_point = {vertices[3 * index_new], vertices[3 * index_new + 1], vertices[3 * index_new + 2]}; 
+		
+		float4 p_hom = transformPoint4x4(triangle_point, projmatrix);
+		p_w[cumsum_for_triangle + i] = 1.0f / (p_hom.w + 0.0000001f);
+		float3 p_proj = { p_hom.x * p_w[cumsum_for_triangle + i], p_hom.y * p_w[cumsum_for_triangle + i], p_hom.z * p_w[cumsum_for_triangle + i] };
+		p_image[cumsum_for_triangle + i] = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
+
+		// calculate distance from p_image to center_triangle_2D
+		distance = __fsqrt_rn((p_image[cumsum_for_triangle + i].x - center_triangle_2D.x) * (p_image[cumsum_for_triangle + i].x - center_triangle_2D.x) + (p_image[cumsum_for_triangle + i].y - center_triangle_2D.y) * (p_image[cumsum_for_triangle + i].y - center_triangle_2D.y));
+
+		if (distance > distance_points) {
+			distance_points = distance;
+		}
+	}
+
+	// Get the three projected 2D points
+	float2 A1 = p_image[cumsum_for_triangle + 0];
+	float2 B1 = p_image[cumsum_for_triangle + 1];
+	float2 C1 = p_image[cumsum_for_triangle + 2];
+	
+
+	// Compute side lengths (opposite each vertex)
+	float a = __fsqrt_rn((B1.x - C1.x) * (B1.x - C1.x) + (B1.y - C1.y) * (B1.y - C1.y)); // Opposite A
+	float b = __fsqrt_rn((A1.x - C1.x) * (A1.x - C1.x) + (A1.y - C1.y) * (A1.y - C1.y)); // Opposite B
+	float c = __fsqrt_rn((A1.x - B1.x) * (A1.x - B1.x) + (A1.y - B1.y) * (A1.y - B1.y)); // Opposite C
+
+	float sum = a + b + c;
+
+	// Incenter weighted by opposite side lengths
+	float2 incenter;
+	incenter.x = (a * A1.x + b * B1.x + c * C1.x) / sum;
+	incenter.y = (a * A1.y + b * B1.y + c * C1.y) / sum;
+ 
+	 int counter = 0;
+	 float dist = 0.0f;
+
+	 float size = 0.0f;
+ 
+ 
+	 for (int i = 0; i < 3; i++) {
+		// Points forming the segment
+		float2 p1_conv = p_image[cumsum_for_triangle + i];
+		float2 p2_conv = p_image[cumsum_for_triangle + (i + 1) % 3];
+ 
+		float nx = p2_conv.y - p1_conv.y;
+		float ny = -(p2_conv.x - p1_conv.x);
+		float norm = __fsqrt_rn(nx * nx + ny * ny);
+		float inv_norm = 1.0f / norm;
+	
+		// Calculate normalized normal and offset
+		float2 normal = {nx * inv_norm, ny * inv_norm};
+
+		float offset = - (normal.x * p1_conv.x + normal.y * p1_conv.y);
+
+		dist = normal.x * incenter.x + normal.y * incenter.y + offset;
+
+		if (dist > 0) {
+			normal.x = -normal.x;
+			normal.y = -normal.y;
+			offset = -offset;
+			dist = -dist;
+		}	
+
+
+		normals[cumsum_for_triangle + i] = normal;
+		offsets[cumsum_for_triangle + i] = offset; 
+	 }
+
+	 // or distance_points < 1 or dist > -1
+	 // A donor-window face defers this sub-pixel cull to its donor: children at
+	 // half the parent's projected size must not vanish where the parent renders.
+	if (donor_win ? donor_cull : (distance_points > 1600 or distance_points < 1 or dist > -1)) {
+			radii[idx] = 0;
+			tiles_touched[idx] = 0;
+			scaling[idx] = 0.0f;
+			return;
+	 }
+
+	// Simple and robust bounding box calculation
+	uint2 rect_min_triangle_test = { grid.x, grid.y };
+	uint2 rect_max_triangle_test = { 0, 0 };
+
+	// The elastic window reaches one inradius (-dist) beyond every edge, so
+	// the conservative box grows by that much.
+	const float pad = elastic_window ? 5.0f - dist : 5.0f;
+
+	// Include all three vertices in the bounding box
+	for (int i = 0; i < 3; i++) {
+		float2 vertex_pos = p_image[cumsum_for_triangle + i];
+		
+		// Convert to tile coordinates with conservative expansion
+		uint bx_min = (uint)floorf((vertex_pos.x - pad) / BLOCK_X); // Expand by 2 pixels
+		uint by_min = (uint)floorf((vertex_pos.y - pad) / BLOCK_Y);
+		uint bx_max = (uint)ceilf((vertex_pos.x + pad) / BLOCK_X);
+		uint by_max = (uint)ceilf((vertex_pos.y + pad) / BLOCK_Y);
+		
+		// Clamp to grid boundaries
+		bx_min = min(grid.x, max(0, bx_min));
+		by_min = min(grid.y, max(0, by_min));
+		bx_max = min(grid.x, max(0, bx_max));
+		by_max = min(grid.y, max(0, by_max));
+		
+		rect_min_triangle_test.x = min(rect_min_triangle_test.x, bx_min);
+		rect_min_triangle_test.y = min(rect_min_triangle_test.y, by_min);
+		rect_max_triangle_test.x = max(rect_max_triangle_test.x, bx_max);
+		rect_max_triangle_test.y = max(rect_max_triangle_test.y, by_max);
+	}
+	
+
+	rect_max[idx] = rect_max_triangle_test;
+	rect_min[idx] = rect_min_triangle_test;
+
+
+	if ((rect_max_triangle_test.x - rect_min_triangle_test.x) * (rect_max_triangle_test.y - rect_min_triangle_test.y) == 0){
+		radii[idx] = 0;
+		tiles_touched[idx] = 0;
+		scaling[idx] = 0.0f;
+		return;
+	}
+
+	float phi_center_min = donor_win ? donor_dist : dist;
+	float max_distance = ceil(distance_points);
+
+	 // We save the 2D Size in Image Space
+	 scaling[idx] = max_distance;
+
+	 phi_center[idx] = {1.0f / phi_center_min, size};
+	 depths[idx] = p_view_triangle.z;
+	 radii[idx] = max_distance;
+	 points_xy_image[idx] = center_triangle_2D;
+	 conic_opacity[idx] = {normal_cvx.x, normal_cvx.y, normal_cvx.z, eff_min_weight};
+	 tiles_touched[idx] = (rect_max_triangle_test.y - rect_min_triangle_test.y) * (rect_max_triangle_test.x - rect_min_triangle_test.x);
+
+ }
+ 
+ // Main rasterization method. Collaboratively works on one tile per
+ // block, each thread treats one pixel. Alternates between fetching 
+ // and rasterizing data.
+ template <uint32_t CHANNELS>
+ __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+ renderCUDA(
+	 const uint2* __restrict__ ranges,
+	 const uint32_t* __restrict__ point_list,
+	 int W, int H,
+	 const float2* __restrict__ normals,
+	 const float* __restrict__ offsets,
+	 const int* __restrict__ window_source,
+	 const int* __restrict__ donor_indices,
+	 const float2* __restrict__ donor_normals,
+	 const float* __restrict__ donor_offsets,
+	 const float2* __restrict__ donor_p_image,
+	 const int donor_mode,
+	 const float2* __restrict__ points_xy_image,
+	 const float* __restrict__ vertex_depth, 
+	 const int* __restrict__ triangles_indices,
+	 const float sigma,
+	 const float* __restrict__ sigma_face,
+	 const float* __restrict__ features,
+	 const float* __restrict__ texels,
+	 const int texel_order,
+	 const float* __restrict__ edge_details,
+	 const int edge_detail_dim,
+	 const float* __restrict__ edge_sh1,
+	 const int* __restrict__ face_edge_ids,
+	 const float4* __restrict__ conic_opacity,
+	 const float* __restrict__ depths,
+	 const float2* __restrict__ phi_center,
+	 const float2* __restrict__ p_image,
+	 const float transmittance_threshold,
+	 const bool absorb_transmittance_tail,
+	 const float* __restrict__ opacity_field,
+	 const bool elastic_window,
+	 float* __restrict__ final_T,
+	 uint32_t* __restrict__ n_contrib,
+	 const float* __restrict__ bg_color,
+	 float* __restrict__ out_color,
+	 float* __restrict__ out_others,
+	 float* __restrict__ max_blending,
+	 int* __restrict__ was_rendered,
+	 float* __restrict__ integrated_blending)
+ {
+	 // Identify current tile and associated min/max pixel range.
+	 auto block = cg::this_thread_block();
+	 uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	 uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	 uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+	 uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	 uint32_t pix_id = W * pix.y + pix.x;
+	 float2 pixf = { (float)pix.x, (float)pix.y };
+ 
+	 // Check if this thread is associated with a valid pixel or outside.
+	 bool inside = pix.x < W&& pix.y < H;
+	 // Done threads can help with fetching, but don't rasterize
+	 bool done = !inside;
+ 
+	 // Load start/end range of IDs to process in bit sorted list.
+	 uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	 const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+	 int toDo = range.y - range.x;
+ 
+	 // Allocate storage for batches of collectively fetched data.
+	 __shared__ int collected_id[BLOCK_SIZE];
+	 __shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+ 
+	 /*
+	 ADDED FOR TRIANGLE PURPOSES ==========================================================================
+	 */
+	 __shared__ float2 collected_normals[BLOCK_SIZE * MAX_NB_POINTS];
+	 __shared__ float collected_offsets[BLOCK_SIZE * MAX_NB_POINTS];
+	 __shared__ float collected_depths[BLOCK_SIZE];
+	 __shared__ float2 collected_xy[BLOCK_SIZE];
+	 __shared__ float2 collected_phi_center[BLOCK_SIZE];
+	 __shared__ float2 collected_p_images[BLOCK_SIZE * MAX_NB_POINTS];
+	 // RITS window donors: the donor's edge lines replace the face's own in the
+	 // soft-window evaluation, and the donor's projected frame replaces the
+	 // face's own in color interpolation; the inside test stays face-local.
+	 __shared__ int collected_donor[BLOCK_SIZE];
+	 __shared__ float2 collected_donor_normals[BLOCK_SIZE * MAX_NB_POINTS];
+	 __shared__ float collected_donor_offsets[BLOCK_SIZE * MAX_NB_POINTS];
+	 __shared__ float2 collected_donor_p_images[BLOCK_SIZE * MAX_NB_POINTS];
+	 __shared__ int collected_donor_vidx[BLOCK_SIZE * MAX_NB_POINTS];
+	 // Per-face window exponents. A null pointer means every face shares the
+	 // scheduled scalar `sigma`, which is the published behaviour.
+	 __shared__ float collected_sigma[BLOCK_SIZE];
+	 const bool per_face_sigma = sigma_face != nullptr;
+	 const bool donor_windows_active = (window_source != nullptr) && (donor_mode & FORWARD::DONOR_WINDOW);
+	 const bool donor_appearance_active = (window_source != nullptr) && (donor_mode & FORWARD::DONOR_APPEARANCE);
+	 const bool donors_active = donor_windows_active || donor_appearance_active;
+	 /*
+	 ===================================================================================================
+	 */
+ 
+	 // Initialize helper variables
+	 float T = 1.0f;
+	 uint32_t contributor = 0;
+	 uint32_t last_contributor = 0;
+	 float C[CHANNELS] = { 0 };
+
+	 // Added from 2DGS
+	 float N[3] = {0};
+	 float D = { 0 };
+	 float M1 = {0};
+	 float M2 = {0};
+	 float distortion = {0};
+	 float median_depth = {0};
+	 float median_contributor = {-1};
+
+	 int pixel_influence = -1;
+ 
+	 // Iterate over batches until all done or range is complete
+	 for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	 {
+		 // End if entire block votes that it is done rasterizing
+		 int num_done = __syncthreads_count(done);
+		 if (num_done == BLOCK_SIZE)
+			 break;
+ 
+		 // Collectively fetch per-Triangle data from global to shared
+		 int progress = i * BLOCK_SIZE + block.thread_rank();
+		 if (range.x + progress < range.y)
+		 {
+			 int coll_id = point_list[range.x + progress];
+			 collected_id[block.thread_rank()] = coll_id;
+			 collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			 collected_depths[block.thread_rank()] = depths[coll_id];
+			 collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			 for (int k = 0; k < 3; k++) {
+				collected_normals[MAX_NB_POINTS * block.thread_rank() + k] = normals[3 * coll_id + k];
+				collected_offsets[MAX_NB_POINTS * block.thread_rank() + k] = offsets[3 * coll_id + k];;
+				collected_p_images[MAX_NB_POINTS * block.thread_rank() + k] = p_image[3 * coll_id + k];
+			}
+			collected_phi_center[block.thread_rank()] = phi_center[coll_id];
+			if (per_face_sigma)
+				collected_sigma[block.thread_rank()] = sigma_face[coll_id];
+			if (donors_active) {
+				int donor_row = window_source[coll_id];
+				collected_donor[block.thread_rank()] = donor_row >= 0;
+				if (donor_row >= 0) {
+					for (int k = 0; k < 3; k++) {
+						if (donor_windows_active) {
+							collected_donor_normals[MAX_NB_POINTS * block.thread_rank() + k] = donor_normals[3 * coll_id + k];
+							collected_donor_offsets[MAX_NB_POINTS * block.thread_rank() + k] = donor_offsets[3 * coll_id + k];
+						}
+						if (donor_appearance_active) {
+							collected_donor_p_images[MAX_NB_POINTS * block.thread_rank() + k] = donor_p_image[3 * coll_id + k];
+							collected_donor_vidx[MAX_NB_POINTS * block.thread_rank() + k] = donor_indices[3 * donor_row + k];
+						}
+					}
+				}
+			}
+		 }
+		 block.sync();
+ 
+		 // Iterate over current batch
+		 for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		 {
+			 // Keep track of current position in range
+			 contributor++;
+ 
+			 int j_id = collected_id[j];
+			 float4 con_o = collected_conic_opacity[j];
+			 float normal[3] = {con_o.x, con_o.y, con_o.z};
+			 float2 phi_center_min = collected_phi_center[j];
+			 float max_val = -INFINITY;
+			 int base = j * MAX_NB_POINTS;
+			 bool outside = false;
+
+			 for (int k = 0; k < 3; k++) {
+				 // Compute the current distance
+				 float dist = (collected_normals[base + k].x * pixf.x
+						  + collected_normals[base + k].y * pixf.y
+						  + collected_offsets[base + k]);
+
+				 if (dist > 0) {
+					outside = true;
+					// The elastic window still covers this pixel, so it
+					// needs the full maximum over the three edges.
+					if (!elastic_window)
+						break;
+				 }
+ 
+				 max_val = fmaxf(max_val, dist);
+			 }
+
+			 if (outside && !elastic_window)
+				continue;
+
+			 if (donor_windows_active && collected_donor[j]) {
+				 // Re-evaluate the soft value in the donor's window: the maximum
+				 // donor-edge distance, clamped to the donor's interior because a
+				 // pixel on the donor boundary may land epsilon outside it.
+				 max_val = -INFINITY;
+				 for (int k = 0; k < 3; k++) {
+					 float dist = (collected_donor_normals[base + k].x * pixf.x
+							  + collected_donor_normals[base + k].y * pixf.y
+							  + collected_donor_offsets[base + k]);
+					 max_val = fmaxf(max_val, dist);
+				 }
+				 max_val = fminf(max_val, 0.0f);
+			 }
+
+			 float phi_x = max_val;
+			 float phi_final = phi_x * phi_center_min.x;
+			 float sigma_j = per_face_sigma ? collected_sigma[j] : sigma;
+			 float Cx;
+			 if (elastic_window) {
+				 float unused;
+				 Cx = elasticWindow(phi_final, sigma_j, unused);
+			 }
+			 else
+				 Cx = fmaxf(0.0f,  __powf(phi_final, sigma_j));
+
+			 // Face opacity: the published min over the three corners, or with
+			 // `opacity_field` the corners interpolated at this pixel.
+			 float opacity = con_o.w;
+			 if (opacity_field != nullptr) {
+				 float3 w;
+				 opacity = interpolateOpacity(collected_p_images + base,
+					 triangles_indices + 3 * j_id, opacity_field, pixf, w);
+			 }
+			 float alpha = min(0.999f, opacity * Cx);
+			 if (alpha < 1.0f / 255.0f)
+				 continue;
+			
+			 atomicAdd(was_rendered + j_id, 1);
+
+			 float test_T = T * (1 - alpha);
+			 const bool absorb_tail =
+				 absorb_transmittance_tail && test_T < transmittance_threshold;
+			 if (test_T < transmittance_threshold && !absorb_tail)
+			 {
+				 done = true;
+				 continue;
+			 }
+			 
+			 float blending_weight = absorb_tail ? T : alpha * T;
+			 // Update the maximum blending weight in a thread-safe way
+			 atomicMax(((int*)max_blending) + j_id, *((int*)(&blending_weight)));
+			 // OATS: the same weight integrated over pixels (and, when the caller
+			 // reuses the buffer, over views) instead of its maximum.
+			 if (integrated_blending != nullptr)
+				 atomicAdd(integrated_blending + j_id, blending_weight);
+
+			 // COLOR INTERPOLATION
+
+			 // A donor-appearance face interpolates in the donor's projected
+			 // frame with the donor's corner vertices: an affine screen-space
+			 // field is determined by its values at three points, so this
+			 // reproduces the donor's color field exactly on the child.
+			 const bool donor_frame = donor_appearance_active && collected_donor[j];
+
+			 // Interpolate the colors
+			 float2 uv0 = donor_frame ? collected_donor_p_images[j * 3 + 0] : collected_p_images[j * 3 + 0];
+			 float2 uv1 = donor_frame ? collected_donor_p_images[j * 3 + 1] : collected_p_images[j * 3 + 1];
+			 float2 uv2 = donor_frame ? collected_donor_p_images[j * 3 + 2] : collected_p_images[j * 3 + 2];
+
+			 // vectors along the edges from uv0
+			 float2 v0 = { uv1.x - uv0.x, uv1.y - uv0.y };
+			 float2 v1 = { uv2.x - uv0.x, uv2.y - uv0.y };
+			 // vector from uv0 to pixel
+			 float2 v2 = { pixf.x  - uv0.x, pixf.y  - uv0.y };
+
+			 // invert the 2×2 [v0 v1] matrix
+			 float denom  = v0.x * v1.y - v1.x * v0.y;
+			 float invDen = 1.0f / denom;    // assume non-degenerate
+
+			 // barycentrics relative to uv0,uv1,uv2
+			 float b0 = ( v2.x * v1.y - v1.x * v2.y) * invDen;
+			 float b1 = (-v2.x * v0.y + v0.x * v2.y) * invDen;
+			 float b2 = 1.0f - b0 - b1;
+			
+			 int aux = 3 * j_id;
+			 int vertex_idx0 = donor_frame ? collected_donor_vidx[j * 3 + 0] : triangles_indices[aux];
+			 int vertex_idx1 = donor_frame ? collected_donor_vidx[j * 3 + 1] : triangles_indices[aux + 1];
+			 int vertex_idx2 = donor_frame ? collected_donor_vidx[j * 3 + 2] : triangles_indices[aux + 2];
+
+			 float depth_vertex_0 =  vertex_depth[vertex_idx0];
+			 float depth_vertex_1 =  vertex_depth[vertex_idx1];
+			 float depth_vertex_2 =  vertex_depth[vertex_idx2];
+
+			 float wA = b2;    // vertex0
+			 float wB = b0;    // vertex1
+			 float wC = b1;    // vertex2
+
+			 // now blend them
+			 // Per-face texel carrier: an ADDITIVE residual on top of the
+			 // vertex-interpolated colour. Zero-initialised, so enabling it does not
+			 // perturb the model at the moment of introduction. The vertex SH keeps
+			 // carrying view-dependence; texels carry high spatial frequency.
+			 const int texel_base = (texels == nullptr)
+				 ? -1
+				 : (j_id * texelSlots(texel_order)
+					+ texelSlot(wA, wB, wC, texel_order)) * CHANNELS;
+			 const int edge_id_ab = edge_details == nullptr ? -1 : face_edge_ids[3 * j_id + 0];
+			 const int edge_id_bc = edge_details == nullptr ? -1 : face_edge_ids[3 * j_id + 1];
+			 const int edge_id_ca = edge_details == nullptr ? -1 : face_edge_ids[3 * j_id + 2];
+			 const float edge_basis_ab = 4.0f * wA * wB;
+			 const float edge_basis_bc = 4.0f * wB * wC;
+			 const float edge_basis_ca = 4.0f * wC * wA;
+			 const int edge_ids[3] = {edge_id_ab, edge_id_bc, edge_id_ca};
+			 const float edge_bases[3] = {edge_basis_ab, edge_basis_bc, edge_basis_ca};
+			 float sh1_interp[3] = {0.0f, 0.0f, 0.0f};
+			 if (edge_detail_dim == 4) {
+				for (int k = 0; k < 3; ++k) {
+					sh1_interp[k] = wA * edge_sh1[3 * vertex_idx0 + k]
+						+ wB * edge_sh1[3 * vertex_idx1 + k]
+						+ wC * edge_sh1[3 * vertex_idx2 + k];
+				}
+			 }
+
+			 for (int ch = 0; ch < CHANNELS; ++ch) {
+				// Access colors per vertex (not per triangle)
+				float c0 = features[vertex_idx0 * CHANNELS + ch];
+				float c1 = features[vertex_idx1 * CHANNELS + ch];
+				float c2 = features[vertex_idx2 * CHANNELS + ch];
+
+				float interp = wA * c0 + wB * c1 + wC * c2;
+				if (texel_base >= 0)
+					interp += texels[texel_base + ch];
+				for (int local_edge = 0; local_edge < 3; ++local_edge) {
+					const int edge_id = edge_ids[local_edge];
+					if (edge_id < 0)
+						continue;
+					const int detail_base = edge_id * edge_detail_dim * CHANNELS;
+					float edge_color = edge_details[detail_base + ch];
+					for (int k = 1; k < edge_detail_dim; ++k)
+						edge_color += sh1_interp[k - 1]
+							* edge_details[detail_base + k * CHANNELS + ch];
+					interp += edge_bases[local_edge] * edge_color;
+				}
+				C[ch] += interp * blending_weight;
+			 } 
+
+			 float depth_interp = wA * depth_vertex_0 + wB * depth_vertex_1 + wC * depth_vertex_2;
+
+			 D  += depth_interp * blending_weight;
+ 
+			 if (T > 0.5) {
+				 median_depth = depth_interp;
+				 median_contributor = contributor;
+				 pixel_influence = j_id;
+			 }
+			 // Render normal map
+			 for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * blending_weight;
+ 
+			 T = absorb_tail ? 0.0f : test_T;
+
+			 last_contributor = contributor;
+			 if (absorb_tail)
+				 done = true;
+		 }
+	 }
+ 
+	 // All threads that treat valid pixel write out their final
+	 // rendering data to the frame and auxiliary buffers.
+	 if (inside)
+	 {	
+		out_others[pix_id + 0 * H * W] = last_contributor;
+		final_T[pix_id] = T;
+		n_contrib[pix_id] = last_contributor;
+		for (int ch = 0; ch < CHANNELS; ch++)
+			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+
+		n_contrib[pix_id + H * W] = median_contributor;
+		out_others[pix_id + DEPTH_OFFSET * H * W] = D;
+		out_others[pix_id + ALPHA_OFFSET * H * W] = 1 - T;
+		for (int ch=0; ch<3; ch++) out_others[pix_id + (NORMAL_OFFSET+ch) * H * W] = N[ch];
+		out_others[pix_id + MIDDEPTH_OFFSET * H * W] = median_depth;
+		out_others[pix_id + DISTORTION_OFFSET * H * W] = pixel_influence;
+	 }
+ }
+ 
+ void FORWARD::render(
+	 const dim3 grid, dim3 block,
+	 const uint2* ranges,
+	 const uint32_t* point_list,
+	 int W, int H,
+	 const float2* normals,
+	 const float* offsets,
+	 const int* window_source,
+	 const int* donor_indices,
+	 const float2* donor_normals,
+	 const float* donor_offsets,
+	 const float2* donor_p_image,
+	 const int donor_mode,
+	 const float2* points_xy_image,
+	 const float* vertex_depth,
+	 const int* triangles_indices,
+	 const float sigma,
+	 const float* sigma_face,
+	 const float* colors,
+	 const float* texels,
+	 const int texel_order,
+	 const float* edge_details,
+	 const int edge_detail_dim,
+	 const float* edge_sh1,
+	 const int* face_edge_ids,
+	 const float4* conic_opacity,
+	 const float* depths,
+	 const float2* phi_center,
+	 const float2* p_image,
+	 const float transmittance_threshold,
+	 const bool absorb_transmittance_tail,
+	 const float* opacity_field,
+	 const bool elastic_window,
+	 float* final_T,
+	 uint32_t* n_contrib,
+	 const float* bg_color,
+	 float* out_color,
+	 float* out_others,
+	float* max_blending,
+	int* was_rendered,
+	float* integrated_blending)
+ {
+	 renderCUDA<NUM_CHANNELS> << <grid, block >> > (
+		 ranges,
+		 point_list,
+		 W, H,
+		 normals,
+		 offsets,
+		 window_source,
+		 donor_indices,
+		 donor_normals,
+		 donor_offsets,
+		 donor_p_image,
+		 donor_mode,
+		 points_xy_image,
+		 vertex_depth,
+		 triangles_indices,
+		 sigma,
+		 sigma_face,
+		 colors,
+		 texels,
+		 texel_order,
+		 edge_details,
+		 edge_detail_dim,
+		 edge_sh1,
+		 face_edge_ids,
+		 conic_opacity,
+		 depths,
+		 phi_center,
+		 p_image,
+		 transmittance_threshold,
+		 absorb_transmittance_tail,
+		 opacity_field,
+		 elastic_window,
+		 final_T,
+		 n_contrib,
+		 bg_color,
+		 out_color,
+		 out_others,
+		 max_blending,
+		 was_rendered,
+		 integrated_blending
+		 );
+ }
+
+ void FORWARD::computeVertexSH1Factors(
+    int V,
+    const float* vertices,
+    const glm::vec3* cam_pos,
+    float* edge_sh1)
+ {
+	computeVertexSH1FactorsCUDA<<<(V + 255) / 256, 256>>>(
+		V, vertices, cam_pos, edge_sh1);
+ }
+
+
+ // Add this to the FORWARD namespace implementation
+ void FORWARD::computeVertexColors(
+    int V, int D, int M,
+    const float* vertices,
+    const float* shs,
+    bool* clamped,
+    float* rgb,
+	float* vertex_depth, 
+	const float* viewmatrix,
+    const glm::vec3* cam_pos)
+ {
+    computeVertexColorsCUDA<<<(V + 255) / 256, 256>>>(
+        V, D, M, vertices, shs, clamped, rgb, vertex_depth, viewmatrix, cam_pos
+    );
+ }
+ 
+ void FORWARD::preprocess(int P, int D, int M,
+	 const float* vertices,
+	 const int* triangles_indices,
+	 const float* vertex_weights,
+	 const int* window_source,
+	 const int* donor_indices,
+	 const int donor_mode,
+	 float2* donor_normals,
+	 float* donor_offsets,
+	 float2* donor_p_image,
+	 const float sigma,
+	 float* scaling,
+	 const float* shs,
+	 bool* clamped,
+	 const float* colors_precomp,
+	 const float* viewmatrix,
+	 const float* projmatrix,
+	 const glm::vec3* cam_pos,
+	 const int W, int H,
+	 const float focal_x, float focal_y,
+	 const float tan_fovx, float tan_fovy,
+	 int* radii,
+	 float2* normals,
+	 float* offsets,
+	 float* p_w,
+	 float2* p_image,
+	 int* indices,
+	 float2* means2D,
+	 float* depths,
+	 float4* conic_opacity,
+	 float2* phi_center,
+	 uint2* rect_min,
+	 uint2* rect_max,
+	 const dim3 grid,
+	 uint32_t* tiles_touched,
+	 bool prefiltered,
+	 const bool opacity_field,
+	 const bool elastic_window)
+ {
+	 preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
+		 P, D, M,
+		 vertices,
+		 triangles_indices,
+		 vertex_weights,
+		 window_source,
+		 donor_indices,
+		 donor_mode,
+		 donor_normals,
+		 donor_offsets,
+		 donor_p_image,
+		 sigma,
+		 scaling,
+		 shs,
+		 clamped,
+		 colors_precomp,
+		 viewmatrix, 
+		 projmatrix,
+		 cam_pos,
+		 W, H,
+		 tan_fovx, tan_fovy,
+		 focal_x, focal_y,
+		 radii,
+		 normals,
+		 offsets,
+		 p_w,
+		 p_image,
+		 indices,
+		 means2D,
+		 depths,
+		 conic_opacity,
+		 phi_center,
+		 rect_min,
+		 rect_max,
+		 grid,
+		 tiles_touched,
+		 prefiltered,
+		 opacity_field,
+		 elastic_window
+		 );
+ }

@@ -1,0 +1,15 @@
+lpips
+plyfile
+mediapy
+opencv-python
+matplotlib
+tqdm 
+trimesh
+open3d
+scikit-image
+scikit-learn
+scipy
+imageio
+mmengine
+mmcv
+timm

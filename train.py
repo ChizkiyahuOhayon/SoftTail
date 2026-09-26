@@ -1,0 +1,781 @@
+#
+# The original code is under the following copyright:
+# Copyright (C) 2023, Inria
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
+# All rights reserved.
+#
+# This software is free for non-commercial, research and evaluation use 
+# under the terms of the LICENSE_GS.md file.
+#
+# For inquiries contact george.drettakis@inria.fr
+#
+# The modifications of the code are under the following copyright:
+# Copyright (C) 2025, University of Liege
+# TELIM research group, http://www.telecom.ulg.ac.be/
+# All rights reserved.
+# The modifications are under the LICENSE.md file.
+#
+# For inquiries contact jan.held@uliege.be
+#
+
+import json
+import os
+
+from adc_densify import install_arm
+import torch
+from random import randint
+from utils.loss_utils import l1_loss, ssim, vertex_depth_loss_hr
+from triangle_renderer import render
+import sys
+from scene import Scene, TriangleModel
+from scene.cgr import CGRTracker, photometric_position_gradient
+from utils.general_utils import safe_state, get_expon_lr_func
+import uuid
+from tqdm import tqdm
+from utils.image_utils import psnr
+from argparse import ArgumentParser, Namespace
+from arguments import ModelParams, PipelineParams, OptimizationParams, update_indoor
+from sota.sigma_schedule import SCHEDULES, schedule as sigma_schedule
+from sota.endpoint import endpoint_image
+from sota.opacity_pooling import pool_beta
+from sota.visibility import (
+    VisibilityTracker,
+    adaptive_floor_schedule,
+    endpoint_from_ambiguity,
+    shuffle_control,
+)
+from sota.survival import budget_matched_delete
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_FOUND = True
+except ImportError:
+    TENSORBOARD_FOUND = False
+import lpips
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
+try:
+    from fused_ssim import fused_ssim
+    FUSED_SSIM_AVAILABLE = True
+    print("Using fused SSIM for faster training.")
+except:
+    FUSED_SSIM_AVAILABLE = False
+try:
+    from diff_triangle_rasterization import SparseGaussianAdam
+    SPARSE_ADAM_AVAILABLE = True
+    print("Sparse Adam optimizer available")
+except:
+    SPARSE_ADAM_AVAILABLE = False
+from utils.render_utils import generate_path, create_videos
+
+
+
+def training(
+        dataset,   
+        opt, 
+        pipe,
+        testing_iterations,
+        checkpoint, 
+        debug_from,
+        scene_name,
+        use_sparse_adam=False,
+        adc_arm="stock",
+        adc_seed=0
+        ):
+    
+    first_iter = 0
+    tb_writer = prepare_output_and_logger(dataset)
+
+    # Load parameters, triangles and scene
+    triangles = TriangleModel(dataset.sh_degree)
+    triangles.opacity_field = opt.opacity_field
+    triangles.elastic_window = opt.elastic_window
+    triangles.integrated_importance = opt.integrated_importance
+
+    scene = Scene(dataset, triangles, opt.set_weight, opt.set_sigma)
+
+    triangles.training_setup(opt, opt.feature_lr, opt.weight_lr, opt.lr_triangles_points_init)
+    triangles.add_percentage = opt.add_percentage
+
+    # ADC-G0 arm. "stock" installs nothing, so the published densification path runs
+    # unchanged; the other arms replace one bound method each. See
+    # experiments/adc_g0/protocol.md.
+    adc_rounds = install_arm(triangles, adc_arm, adc_seed)
+
+
+    if checkpoint:
+        (model_params, first_iter) = torch.load(checkpoint)
+        triangles.restore(model_params, opt)
+
+    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+    iter_start = torch.cuda.Event(enable_timing = True)
+    iter_end = torch.cuda.Event(enable_timing = True)
+
+    viewpoint_stack = scene.getTrainCameras().copy()
+    number_of_training_views = len(viewpoint_stack)
+
+    ema_loss_for_log = 0.0
+    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    first_iter += 1
+
+    # define the scheduler for sigma and opacity
+    initial_sigma = opt.set_sigma
+    final_sigma = 0.0001
+    triangles.final_sigma = final_sigma
+    sigma_start = opt.sigma_start
+    total_iters = opt.sigma_until
+
+    init_opacity = 0.1
+    final_opacity = float(opt.final_opacity)
+    if not init_opacity <= final_opacity < 1.0:
+        raise ValueError("final_opacity must be in [0.1, 1.0)")
+    total_iters_opacity = opt.final_opacity_iter
+
+    # SoftTail v2 (VATO). Off => nothing below runs and the floor stays the v1
+    # scalar. On => after the restricted-Delaunay rebuild a per-vertex
+    # surface-dominance ratio is tracked and every floor update maps it to a
+    # per-vertex endpoint in [adaptive_opacity_low, final_opacity].
+    vato_active = bool(getattr(opt, "adaptive_opacity", False))
+    vato_tracker = None
+    if vato_active:
+        vato_low = float(opt.adaptive_opacity_low)
+        if not init_opacity <= vato_low <= final_opacity:
+            raise ValueError("adaptive_opacity_low must be in [0.1, final_opacity]")
+        if opt.adaptive_opacity_control not in ("none", "shuffle"):
+            raise ValueError("adaptive_opacity_control must be 'none' or 'shuffle'")
+        triangles.adaptive_opacity = {
+            "low": vato_low,
+            "high": final_opacity,
+            "ema": float(opt.adaptive_opacity_ema),
+            "control": str(opt.adaptive_opacity_control),
+        }
+
+    lambda_weight = opt.lambda_weight
+    prune_triangles = opt.prune_triangles_threshold
+    prune_size = opt.prune_size
+    start_upsampling = opt.start_upsampling
+    splitt_large_triangles = opt.splitt_large_triangles
+    triangles.size_probs_zero = opt.size_probs_zero
+    triangles.size_probs_zero_image_space = opt.size_probs_zero_image_space
+    
+    need_delaunay = False
+
+    run_restricted_delaunay = opt.densify_until_iter + 1000
+
+    depth_l1_weight = get_expon_lr_func(opt.depth_lambda_init, opt.depth_lambda_final, max_steps=opt.iterations)
+
+    # CGR diagnostic (E9): observe the per-vertex photometric-gradient trajectory in a
+    # short fixed-topology window ending at each requested iteration, so we can read the
+    # signal at several convergence stages. Off by default -> baseline is byte-identical.
+    cgr_tracker = None
+    cgr_dump_iters = []
+    if getattr(opt, "cgr_diag", False):
+        cgr_dump_iters = sorted(int(x) for x in str(opt.cgr_dump_iters).split(",") if x.strip())
+        w = opt.cgr_window
+        for d in cgr_dump_iters:
+            assert 1 <= d - w + 1 and d <= opt.iterations, \
+                f"CGR dump iter {d} with window {w} is out of [1, {opt.iterations}]."
+            # A window must not straddle the restricted-Delaunay retriangulation (the only
+            # vertex-count change we cannot freeze): keep it entirely before or after.
+            assert (d <= run_restricted_delaunay - 2) or (d - w + 1 >= run_restricted_delaunay + 2), (
+                f"CGR window [{d - w + 1},{d}] straddles run_restricted_delaunay "
+                f"({run_restricted_delaunay}); pick dump iters clear of it.")
+
+    for iteration in range(first_iter, opt.iterations + 1):
+
+        # Active inside any [d - window + 1, d] window; topology is frozen there so the
+        # tracker's per-vertex buffers stay index-aligned with the vertices.
+        cgr_active = any(d - opt.cgr_window < iteration <= d for d in cgr_dump_iters)
+
+        if need_delaunay:
+            with torch.no_grad():
+                triangles.run_restricted_delaunay()
+                # The face set has just been rebuilt, so this is the first moment a
+                # per-face carrier is well defined. Zero-init keeps the model identical
+                # to the baseline here; everything before this point is untouched.
+                triangles.create_texels(opt.texel_order, opt.texel_lr)
+                # Same moment, same reason: the face set is only now stable.
+                triangles.create_face_hardness(opt.face_hardness, opt.face_hardness_lr,
+                                               opt.face_hardness_spread)
+                if vato_active:
+                    # The vertex set is stable from here to the final cleanup.
+                    vato_tracker = VisibilityTracker(
+                        triangles.vertices.shape[0], rho=opt.adaptive_opacity_ema,
+                        device=triangles.vertices.device)
+                    print(f"[vato] tracking surface dominance for "
+                          f"{vato_tracker.n_vertices:,} vertices from iteration {iteration}")
+            need_delaunay = False
+
+        # Supersampling
+        if iteration == start_upsampling:
+            triangles.scaling = opt.upscaling_factor
+        if iteration == start_upsampling + 5000:
+            triangles.scaling = opt.final_scaling
+
+        iter_start.record()
+        triangles.update_learning_rate(iteration)
+
+        # Sigma schedule. "linear" is the published path; the others keep the same
+        # endpoints but anneal the window's area coverage instead of sigma itself.
+        current_sigma = sigma_schedule(
+            opt.sigma_schedule, iteration, initial_sigma, final_sigma,
+            sigma_start, total_iters, decay=opt.lr_triangles_points_decay,
+        )
+        triangles.set_sigma(current_sigma)
+
+        # Every 1000 its we increase the levels of SH up to a maximum degree
+        if iteration % 1000 == 0:
+            triangles.oneupSHdegree()
+
+        # Render
+        if (iteration - 1) == debug_from:
+            pipe.debug = True
+
+        bg = torch.rand((3), device="cuda") if opt.random_background else background
+
+        if not viewpoint_stack or len(scene.getTrainCameras()) + iteration == opt.iterations:
+            viewpoint_stack = scene.getTrainCameras().copy()
+            if len(scene.getTrainCameras()) + iteration == opt.iterations:
+                triangles.importance_score = torch.zeros((triangles._triangle_indices.shape[0]), dtype=torch.float, device="cuda") # reset to 0 to ensure that everything is deleted with an importance score of 0
+                triangles.integrated_score = torch.zeros((triangles._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+
+        endpoint_render = None
+        if opt.endpoint_supervision:
+            with torch.no_grad():
+                endpoint_render = render(
+                    viewpoint_cam,
+                    triangles,
+                    pipe,
+                    bg,
+                    sigma_override=final_sigma,
+                    opacity_floor_override=final_opacity,
+                    upsample_override=opt.final_scaling,
+                )["render"]
+
+        # The softmin temperature is expressed in units of the opacity range the
+        # floor currently leaves open, so it tracks the floor ramp instead of
+        # introducing a second schedule. Outside the ramp it is 0: hard routing.
+        opacity_pool_beta = 0.0
+        if opt.opacity_pool:
+            a_floor = min(1.0, max(0.0, (iteration - opt.start_opacity_floor)
+                                   / max(1, total_iters_opacity - opt.start_opacity_floor)))
+            floor_now = min(init_opacity + (final_opacity - init_opacity) * a_floor,
+                            final_opacity)
+            opacity_pool_beta = pool_beta(
+                iteration, floor_now, opt.start_opacity_floor, total_iters_opacity,
+                opt.opacity_pool_k_start, opt.opacity_pool_k_end)
+
+        # The kernel adds alpha * T into this buffer for every face it touches,
+        # so the sum runs over the pixels of this view and over every view since
+        # the last densification, which is the window the peak statistic spans.
+        integrated_buffer = triangles.integrated_score if opt.integrated_importance else None
+        render_pkg = render(viewpoint_cam, triangles, pipe, bg,
+                            opacity_pool_beta=opacity_pool_beta,
+                            integrated_blending=integrated_buffer)
+        image = render_pkg["render"]
+        if endpoint_render is not None:
+            image = endpoint_image(image, endpoint_render)
+
+        if vato_tracker is not None:
+            with torch.no_grad():
+                vato_tracker.update(render_pkg["rend_ids"].detach(),
+                                    render_pkg["triangle_was_rendered"].detach(),
+                                    triangles._triangle_indices)
+
+        # Loss
+        gt_image = viewpoint_cam.original_image.cuda()
+        if getattr(viewpoint_cam, "normal_map", None) is not None:
+            gt_normal = viewpoint_cam.normal_map.cuda()
+            seg_hr = gt_normal.unsqueeze(0)  # -> [1, 3, H, W]
+            seg_ds_area = F.interpolate(seg_hr, size=(gt_image.shape[1], gt_image.shape[2]), mode="area")  # [1, 3, H0, W0]
+            gt_normal = seg_ds_area.squeeze(0)  # -> [3, H0, W0]
+        else:
+            gt_normal = None
+
+        pixel_loss = l1_loss(image, gt_image)
+
+        image_size = render_pkg["scaling"].detach()
+        mask = image_size > triangles.image_size
+        triangles.image_size[mask] = image_size[mask]
+
+        importance_score = render_pkg["max_blending"].detach()
+        mask = importance_score > triangles.importance_score
+        triangles.importance_score[mask] = importance_score[mask]
+
+        pixel_count = render_pkg["triangle_was_rendered"].detach() # Not used but could be useful. Gives per triangle, the number of pixels it covered in the current render
+        mask = pixel_count > triangles.pixel_count
+        triangles.pixel_count[mask] = pixel_count[mask]
+
+        if FUSED_SSIM_AVAILABLE:
+            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+        else:
+            ssim_value = ssim(image, gt_image)
+
+        loss_image = (1.0 - opt.lambda_dssim) * pixel_loss + opt.lambda_dssim * (1.0 - ssim_value)
+
+        # CGR diagnostic: read the UNCONTAMINATED photometric position gradient at
+        # the rasterizer autograd boundary (before any regularizer joins the loss)
+        # and feed the per-vertex trajectory EMAs. retain_graph keeps the real
+        # backward below intact; .grad is never written, so there is no feedback.
+        if cgr_active:
+            if cgr_tracker is None:  # fresh tracker at each window start (topology may differ)
+                cgr_tracker = CGRTracker(triangles.vertices.shape[0], rho=opt.cgr_rho,
+                                         device=triangles.vertices.device)
+            cgr_tracker.update(photometric_position_gradient(loss_image, triangles.vertices))
+        else:
+            cgr_tracker = None  # reset between windows
+
+        # FINAL LOSS
+        loss = loss_image
+
+        # Opacity loss
+        Lweight_pure = 0.0
+        lambda_weight = opt.lambda_weight if iteration < opt.start_opacity_floor else 0
+        if lambda_weight > 0:
+            mask_out = triangles.vertices.shape[0]
+            vertex_weights = triangles.get_vertex_weight[:mask_out][triangles._triangle_indices]
+            Lweight_pure = vertex_weights.mean()
+            Lweight = lambda_weight * Lweight_pure
+            loss += Lweight
+        else:
+            Lweight = 0
+
+        # Vertex depth regularization
+        Lvertex_depth_pure = 0.0
+        lambda_vertex = opt.lambda_vertex if iteration > opt.start_vertex_opt else 0
+        if lambda_vertex > 0:
+            depth_down = render_pkg["surf_depth"]
+            vertex_depth_out = render_pkg["vertex_depth_out"]
+            image_2D = render_pkg["image_2D"]
+            vertex_rendered = render_pkg["vertex_rendered"]
+            Lvertex_depth_pure = vertex_depth_loss_hr(
+                vertex_depth_out,
+                image_2D,
+                vertex_rendered,
+                depth_down,
+                max_diff_threshold=opt.max_diff_threshold,
+            )
+            Lvertex_depth = lambda_vertex * Lvertex_depth_pure
+            loss += Lvertex_depth
+        else:
+            Lvertex_depth = 0
+
+        # Depth loss
+        Ll1depth_pure = 0.0
+        if depth_l1_weight(iteration) > 0 and getattr(viewpoint_cam, "invdepthmap", None) is not None:
+            invDepth = 1.0 / (render_pkg["expected_depth"] + 1e-6)
+            mono_invdepth = viewpoint_cam.invdepthmap.cuda()
+            depth_mask = viewpoint_cam.depth_mask.cuda()
+            Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
+            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
+            loss += Ll1depth
+        else:
+            Ll1depth = 0
+
+        rend_normal = render_pkg['rend_normal']
+        surf_normal = render_pkg['surf_normal']
+
+        # ------- ResidualGate: per-face g_m signal + normal-loss gating -------
+        # Pure PyTorch. Reuses the per-pixel dominant-face id (render_pkg['render_id'],
+        # full-res) nearest-downsampled to the loss resolution. Active only once
+        # appearance has largely converged (after the Delaunay transition), so the
+        # photometric residual is appearance-saturated (rendered with the live SH).
+        resgate_wmap = None
+        if getattr(opt, "resgate", False) and iteration >= opt.resgate_from_iter:
+            with torch.no_grad():
+                H0, W0 = image.shape[1], image.shape[2]
+                Fn = triangles._triangle_indices.shape[0]
+                fid = torch.nn.functional.interpolate(
+                    render_pkg["rend_ids"].unsqueeze(0), size=(H0, W0),
+                    mode="nearest").squeeze(0).squeeze(0)                  # [H0,W0] float ids
+                # Coverage: bound the id to a valid face index (background pixels carry a
+                # large sentinel id -> an out-of-range scatter/gather is an illegal CUDA
+                # access) AND require the pixel to be actually on the surface (rendered
+                # alpha), so a face's residual is not contaminated by background pixels.
+                alpha_ds = torch.nn.functional.interpolate(
+                    render_pkg["rend_alpha"].unsqueeze(0), size=(H0, W0),
+                    mode="bilinear", align_corners=False).squeeze(0).squeeze(0)
+                cov = (fid >= 0) & (fid < Fn) & (alpha_ds > opt.resgate_alpha)
+                fid_l = fid.long().clamp_(0, Fn - 1)
+                res_pix = (image - gt_image).abs().mean(0)                 # [H0,W0] appearance-saturated
+                covf = fid_l[cov].reshape(-1)
+                s = torch.zeros(Fn, device=image.device).scatter_add_(0, covf, res_pix[cov].reshape(-1))
+                n = torch.zeros(Fn, device=image.device).scatter_add_(0, covf, torch.ones_like(res_pix[cov].reshape(-1)))
+                face_res = torch.where(n > 0, s / n.clamp_min(1), torch.full((Fn,), float("inf"), device=image.device))
+                triangles.resgate_accumulate(face_res)
+                # refresh on a per-window step COUNT (not global iteration modulo), so the
+                # first window aggregates a full set of views, not a single one.
+                if triangles.resgate_should_refresh(opt.resgate_refresh):
+                    triangles.resgate_refresh(opt.resgate_signal, opt.resgate_norm_q,
+                                              triangles.vertices, opt.resgate_ema, opt.resgate_min_views)
+                if triangles._g_m_ready and triangles._g_m.shape[0] == Fn:
+                    phi = triangles.resgate_weight(opt.resgate_floor)      # [F] in [floor,1]
+                    resgate_wmap = torch.where(cov, phi[fid_l], torch.ones_like(res_pix))  # [H0,W0]
+
+        # Normal regularization (2DGS)
+        Lnormal_pure = 0.0
+        lambda_normal = opt.lambda_normals if iteration > opt.iteration_mesh else 0
+        if lambda_normal > 0:
+            normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
+            if resgate_wmap is not None:
+                w = resgate_wmap[None]
+                Lnormal_pure = (normal_error * w).sum() / w.sum().clamp_min(1e-8)
+            else:
+                Lnormal_pure = normal_error.mean()
+            Lnormal = lambda_normal * Lnormal_pure
+            loss += Lnormal
+        else:
+            Lnormal = 0
+
+        # supervised normal loss
+        if gt_normal is not None:
+            lambda_normals_super = opt.lambda_normals_super if iteration > opt.iteration_mesh else 0
+            normal_error = (1 - (rend_normal * gt_normal).sum(dim=0))[None]
+            normal_loss_super = lambda_normals_super * (normal_error).mean()
+            loss += normal_loss_super
+
+        # Texel residual regularizers (only active once the carrier exists)
+        tex = triangles.get_texels
+        if tex is not None and (opt.texel_l2 > 0 or opt.texel_tv > 0):
+            if opt.texel_l2 > 0:
+                loss = loss + opt.texel_l2 * tex.pow(2).mean()
+            if opt.texel_tv > 0:
+                # within-face variance: penalise texels of one face deviating from that
+                # face's own mean -> spatial smoothness with no adjacency bookkeeping
+                loss = loss + opt.texel_tv * tex.var(dim=1, unbiased=False).mean()
+
+        loss.backward()
+        iter_end.record()
+
+        
+        with torch.no_grad():
+            # Progress bar
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            if iteration % 10 == 0:
+                loss_dict = {
+                    "Loss": f"{ema_loss_for_log:.{5}f}",
+                }
+                progress_bar.set_postfix(loss_dict)
+                progress_bar.update(10)
+            if iteration == opt.iterations:
+                progress_bar.close()
+
+            # Log and save
+            
+            training_report(tb_writer, scene_name, iteration, pixel_loss, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+
+            # Dump the CGR diagnostic signals at the end of the window (per-face
+            # O_i / nu_i / curvature + geometry, for the offline ROC-AUC test).
+            if cgr_active and iteration in cgr_dump_iters:
+                dump_path = os.path.join(scene.model_path, f"cgr_diag_{iteration}.npz")
+                cgr_tracker.dump(dump_path, vertices=triangles.vertices,
+                                 faces=triangles._triangle_indices)
+                print(f"\n[CGR] diagnostic dumped to {dump_path} after {cgr_tracker.steps} steps.")
+                if iteration == cgr_dump_iters[-1]:
+                    print("[CGR] last diagnostic window done; stopping (diagnostic run).")
+                    break
+
+            # Handle pruning operations. Frozen while the CGR diagnostic is active so
+            # the tracker's per-vertex buffers stay index-aligned with the vertices.
+            if iteration % 500 == 0 and iteration < run_restricted_delaunay and not cgr_active:
+                
+                # Building masks to delete triangles
+                mask_opacity     = (triangles.face_opacity() <= prune_triangles)          # delete if too low
+                mask_importance  = (triangles.importance_score <= prune_triangles).squeeze()  # delete if too low
+                if opt.integrated_importance:
+                    mask_importance = budget_matched_delete(
+                        mask_importance, triangles.integrated_score.squeeze())
+                mask_size        = (triangles.image_size > prune_size).squeeze()                 # delete if too big
+
+                delete_mask = mask_opacity | mask_size
+
+                if number_of_training_views < 500: # only delete if the number of views are below 500. Otherwise, we might delete too much
+                    delete_mask = delete_mask | mask_importance
+
+                keep_mask   = ~delete_mask 
+
+                if iteration > opt.start_pruning:
+                    triangles.prune_triangles(keep_mask)
+             
+                # We prune vertices that are no longer used
+                device = triangles.vertices.device
+                used_vertex_mask = torch.zeros(triangles.vertices.shape[0], 
+                                            dtype=torch.bool, 
+                                            device=device)
+                if triangles._triangle_indices.numel() > 0:
+                    flat_indices = triangles._triangle_indices.flatten()
+                    used_vertex_mask[flat_indices] = True
+                
+                weight_mask = (triangles.get_vertex_weight.squeeze() >= prune_triangles)
+                mask_out = triangles.vertices.shape[0]
+                vertex_mask = weight_mask[:mask_out] | used_vertex_mask
+
+                triangles._prune_vertices(vertex_mask)
+
+
+                triangle_vertex_weights = triangles.opacity_activation(
+                    triangles.vertex_weight[triangles._triangle_indices]
+                )  # [T,3]
+
+                needs_densification = (iteration < opt.densify_until_iter and 
+                                     iteration % opt.densification_interval == 0 and 
+                                     iteration > opt.densify_from_iter)
+                
+                if needs_densification:
+                    triangles.add_new_gs(iteration, cap_max=opt.max_points, splitt_large_triangles=splitt_large_triangles)
+   
+
+                if iteration > opt.start_opacity_floor:
+                    start_iter = opt.start_opacity_floor
+                    end_iter = total_iters_opacity  # the iteration where you want to reach final_opacity
+                    a = min(1.0, max(0.0, (iteration - start_iter) / max(1, end_iter - start_iter)))
+                    current_opacity = init_opacity + (final_opacity - init_opacity) * a
+                    current_opacity = min(current_opacity, final_opacity)
+                    triangles.update_min_weight(current_opacity)
+
+                    prune_triangles += 0.01 
+                    mask_out = triangles.vertices.shape[0]
+                    triangle_vertex_weights = triangles.get_vertex_weight[:mask_out][triangles._triangle_indices]
+            elif iteration == run_restricted_delaunay:
+                need_delaunay = True
+            elif iteration % 500 == 0 and iteration > run_restricted_delaunay + 1000:
+
+                if iteration > opt.start_opacity_floor:
+                    start_iter = opt.start_opacity_floor
+                    end_iter = total_iters_opacity  # the iteration where you want to reach final_opacity
+                    a = min(1.0, max(0.0, (iteration - start_iter) / max(1, end_iter - start_iter)))
+                    current_opacity = init_opacity + (final_opacity - init_opacity) * a
+                    current_opacity = min(current_opacity, final_opacity)
+                    if vato_tracker is not None:
+                        # Per-vertex endpoint from the tracked dominance ratio; the
+                        # scalar reference keeps the v1 schedule for provenance.
+                        tau_v = endpoint_from_ambiguity(vato_tracker.ratio(), vato_low, final_opacity)
+                        if opt.adaptive_opacity_control == "shuffle":
+                            tau_v = shuffle_control(tau_v)
+                        floor_v = adaptive_floor_schedule(tau_v, init_opacity, a).unsqueeze(1)
+                        triangles.update_min_weight(floor_v, reference_floor=current_opacity)
+                    else:
+                        triangles.update_min_weight(current_opacity)
+
+                    prune_triangles += 0.01 
+                    mask_out = triangles.vertices.shape[0]
+                    triangle_vertex_weights = triangles.get_vertex_weight[:mask_out][triangles._triangle_indices]
+            
+
+            if iteration < opt.iterations:
+                triangles.optimizer.step()
+                triangles.optimizer.zero_grad(set_to_none = True)
+                if triangles.texel_optimizer is not None:
+                    triangles.texel_optimizer.step()
+                    triangles.texel_optimizer.zero_grad(set_to_none = True)
+                if triangles.face_hardness_optimizer is not None:
+                    triangles.face_hardness_optimizer.step()
+                    triangles.face_hardness_optimizer.zero_grad(set_to_none = True)
+
+    # cleaning of triangles that we do not need. `max_blending` is a per-pixel
+    # maximum, so the supersampling factor sets how many chances each face gets
+    # to clear the threshold; pinning it makes the criterion independent of the
+    # training schedule instead of inheriting whatever factor training ended on.
+    if opt.cleanup_scaling:
+        triangles.scaling = opt.cleanup_scaling
+    if opt.save_precleanup:
+        precleanup = scene.save("precleanup")
+        with open(os.path.join(os.path.dirname(precleanup), "cleanup.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump({"cleanup_scaling": int(triangles.scaling),
+                       "final_iteration": int(iteration)}, handle)
+    viewpoint_stack = scene.getTrainCameras().copy()
+    triangles.importance_score = torch.zeros((triangles._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
+    while viewpoint_stack:
+        viewpoint_cam = viewpoint_stack.pop(0)
+        render_pkg = render(viewpoint_cam, triangles, pipe, bg)
+
+        importance_score = render_pkg["max_blending"].detach()
+        mask = importance_score > triangles.importance_score
+        triangles.importance_score[mask] = importance_score[mask]
+    mask_importance  = (triangles.importance_score <= 0.5).squeeze() 
+    triangles.prune_triangles(~mask_importance) # delete all the remaining triangles that do not have an influence
+
+    device = triangles.vertices.device
+    used_vertex_mask = torch.zeros(triangles.vertices.shape[0], 
+                                dtype=torch.bool, 
+                                device=device)
+    if triangles._triangle_indices.numel() > 0:
+        # Flatten indices and mark used vertices
+        flat_indices = triangles._triangle_indices.flatten()
+        used_vertex_mask[flat_indices] = True
+    
+    vertex_mask = used_vertex_mask
+    if vato_active:
+        if vato_tracker is None or triangles.opacity_floor_vertex is None:
+            raise RuntimeError(
+                "--adaptive_opacity was requested but no per-vertex floor was ever assigned "
+                "(the run did not pass the restricted-Delaunay rebuild and a floor update).")
+        # Final surface-dominance ratio, stored for the mechanism diagnostics; it is
+        # vertex-indexed and follows the cleanup prune below.
+        triangles.visibility_dominance = vato_tracker.ratio()
+    triangles._prune_vertices(vertex_mask)
+
+    # Fail loudly if a texel carrier was requested but never actually created (e.g. the
+    # run ended before the Delaunay retriangulation, or resumed past it): otherwise
+    # --texel_order would silently train a plain baseline and mislabel the result.
+    if opt.texel_order > 0 and triangles.texel_order == 0:
+        raise RuntimeError(
+            f"--texel_order {opt.texel_order} was requested but the carrier was never "
+            f"initialized (run_restricted_delaunay at iter "
+            f"{opt.densify_until_iter + 1000} may not have executed).")
+
+    scene.save(iteration)
+
+    # The realised depth histogram is ADC-G0's manipulation check: an arm whose
+    # rounds show no depth-2 faces concentrated nothing, and a null result from it
+    # would say nothing about the hypothesis.
+    if adc_rounds:
+        with open(os.path.join(dataset.model_path, "adc_rounds.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump({"arm": adc_arm, "seed": adc_seed, "rounds": adc_rounds},
+                      handle, indent=2, allow_nan=False)
+
+    print("Training is done")
+
+def prepare_output_and_logger(args):    
+    if not args.model_path:
+        if os.getenv('OAR_JOB_ID'):
+            unique_str=os.getenv('OAR_JOB_ID')
+        else:
+            unique_str = str(uuid.uuid4())
+        args.model_path = os.path.join("./output/", unique_str[0:10])
+        
+    # Set up output folder
+    print("Output folder: {}".format(args.model_path))
+    os.makedirs(args.model_path, exist_ok = True)
+    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
+        cfg_log_f.write(str(Namespace(**vars(args))))
+
+    # Create Tensorboard writer
+    tb_writer = None
+    if TENSORBOARD_FOUND:
+        tb_writer = SummaryWriter(args.model_path)
+    else:
+        print("Tensorboard not available: not logging progress")
+    return tb_writer
+
+def training_report(tb_writer, scene_name, iteration, pixel_loss, loss, loss_fn, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+    if tb_writer:
+        tb_writer.add_scalar('train_loss_patches/pixel_loss', pixel_loss.item(), iteration)
+        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+        tb_writer.add_scalar('iter_time', elapsed, iteration)
+
+    # Report test and samples of training set
+    if iteration % 1000 == 0:
+        torch.cuda.empty_cache()
+        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
+                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+
+        for config in validation_configs:
+            if config['cameras'] and len(config['cameras']) > 0:
+                pixel_loss_test = 0.0
+                psnr_test = 0.0
+                ssim_test = 0.0
+                lpips_test = 0.0
+                total_time = 0.0
+                for idx, viewpoint in enumerate(config['cameras']):
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+                    start_event.record()
+                    image = torch.clamp(renderFunc(viewpoint, scene.triangles, *renderArgs)["render"], 0.0, 1.0)
+                    end_event.record()
+                    torch.cuda.synchronize()
+                    runtime = start_event.elapsed_time(end_event)
+                    total_time += runtime
+
+                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    if tb_writer and (idx < 5):
+                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                        if iteration == testing_iterations[0]:
+                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                    pixel_loss_test += loss_fn(image, gt_image).mean().double()
+                    psnr_test += psnr(image, gt_image).mean().double()
+                    ssim_test += ssim(image, gt_image).mean().double()
+                    lpips_test += lpips_fn(image, gt_image).mean().double()
+                psnr_test /= len(config['cameras'])
+                pixel_loss_test /= len(config['cameras'])       
+                ssim_test /= len(config['cameras'])
+                lpips_test /= len(config['cameras'])  
+                total_time /= len(config['cameras'])
+                fps = 1000.0 / total_time
+                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {} FPS {}".format(iteration, config['name'], pixel_loss_test, psnr_test, ssim_test, lpips_test, fps))
+
+                if tb_writer:
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', pixel_loss_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+
+                if tb_writer:
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', pixel_loss_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+
+        torch.cuda.empty_cache()
+
+if __name__ == "__main__":
+    # Set up command line argument parser
+    parser = ArgumentParser(description="Training script parameters")
+    lp = ModelParams(parser)
+    op = OptimizationParams(parser)
+    pp = PipelineParams(parser)
+    parser.add_argument('--debug_from', type=int, default=-1)
+    parser.add_argument('--detect_anomaly', action='store_true', default=False)
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="seed for python, numpy and torch; 0 is the published value")
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--start_checkpoint", type=str, default = None)
+
+    parser.add_argument('--wandb_name', default="Test", type=str)
+    parser.add_argument('--scene_name', default="Garden", type=str)
+    parser.add_argument("--use_sparse_adam", action="store_true", default=True)
+    parser.add_argument("--indoor", action="store_true", default=False)
+    parser.add_argument("--adc_arm", type=str, default="stock",
+                        choices=("stock", "rng", "multiplicity"),
+                        help="ADC-G0 densification arm; stock is the published pipeline")
+
+    args = parser.parse_args(sys.argv[1:])
+    args.save_iterations.append(args.iterations)
+
+    print("Optimizing " + args.model_path)
+
+    lpips_fn = lpips.LPIPS(net='vgg').to(device="cuda")
+
+    # Initialize system state (RNG)
+    safe_state(args.quiet, args.seed)
+
+    lps = lp.extract(args)
+    ops = op.extract(args)
+    pps = pp.extract(args)
+
+    if args.indoor:
+        ops = update_indoor(ops)
+    if ops.sigma_schedule not in SCHEDULES:
+        parser.error(f"--sigma_schedule must be one of {SCHEDULES}, got {ops.sigma_schedule!r}")
+
+    # Configure and run training
+    torch.autograd.set_detect_anomaly(args.detect_anomaly)
+    training(lps,
+             ops,
+             pps,
+             args.test_iterations,
+             args.start_checkpoint,
+             args.debug_from,
+             args.scene_name,
+             use_sparse_adam=args.use_sparse_adam,
+             adc_arm=args.adc_arm,
+             adc_seed=args.seed
+             )
+    
+    # All done
+    print("\nTraining complete.")
