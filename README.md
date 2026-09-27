@@ -88,16 +88,18 @@ the output is one indexed mesh with shared vertices.
 | Method | Connected | M360 PSNR ↑ | M360 SSIM ↑ | M360 LPIPS ↓ | T&T PSNR ↑ | T&T SSIM ↑ | T&T LPIPS ↓ |
 |---|:---:|---:|---:|---:|---:|---:|---:|
 | 2DGS (mesh) | ✓ | 15.36 | 0.498 | 0.474 | 14.23 | 0.569 | 0.485 |
-| GOF (mesh) | ✓ | 20.78 | 0.573 | 0.465 | 21.69 | 0.690 | 0.326 |
+| GOF (mesh) | ✓ | 20.78 | 0.573 | 0.465 | **21.69** | 0.690 | 0.326 |
 | RaDe-GS (mesh) | ✓ | 23.56 | 0.668 | 0.361 | 20.51 | 0.659 | 0.344 |
 | MiLo | ✓ | 24.09 | 0.688 | 0.323 | 21.46 | 0.706 | 0.348 |
 | MeshSplatting | ✓ | 24.78 | 0.728 | 0.310 | 20.52 | 0.745 | 0.287 |
 | Triangle Splatting+ | semi | **25.21** | 0.742 | 0.294 | 20.91 | 0.773 | 0.249 |
-| **SoftTail (ours)** | ✓ | 25.17 | **0.748** | **0.285** | **21.06** | **0.778** | **0.249** |
+| **SoftTail (ours)** | ✓ | 25.17 | **0.748** | **0.285** | 21.06 | **0.778** | **0.249** |
 
-SoftTail is the best connected-mesh method on every metric of both benchmarks,
-and ahead of the semi-connected Triangle Splatting+ on five of the six
-(T&T LPIPS is `0.2487` against `0.249`).
+On Mip-NeRF 360, SoftTail is the best connected-mesh method on all three
+metrics. On Tanks & Temples it has the best SSIM and LPIPS of every mesh
+method, while GOF (12M vertices) and MILo (4M) keep a higher PSNR.
+Against the semi-connected Triangle Splatting+ it is ahead on five of the six
+numbers (T&T LPIPS is `0.2487` against `0.249`).
 
 ### Mip-NeRF 360 (9 scenes)
 
