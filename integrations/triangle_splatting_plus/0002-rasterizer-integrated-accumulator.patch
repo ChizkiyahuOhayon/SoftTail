@@ -1,0 +1,189 @@
+From dc81f2a64b3d2e36b8966a5f98b9bf7cb052024d Mon Sep 17 00:00:00 2001
+From: Zhao Liu <128977742+ChizkiyahuOhayon@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 19:22:16 -0700
+Subject: [PATCH] Accumulate the integrated blending weight next to the peak
+
+---
+ cuda_rasterizer/forward.cu              | 11 ++++++++---
+ cuda_rasterizer/forward.h               |  3 ++-
+ cuda_rasterizer/rasterizer.h            |  1 +
+ cuda_rasterizer/rasterizer_impl.cu      |  4 +++-
+ diff_triangle_rasterization/__init__.py |  9 +++++----
+ rasterize_points.cu                     |  6 ++++--
+ rasterize_points.h                      |  2 +-
+ 7 files changed, 24 insertions(+), 12 deletions(-)
+
+diff --git a/cuda_rasterizer/forward.cu b/cuda_rasterizer/forward.cu
+index 72652ff..da0fa8f 100644
+--- a/cuda_rasterizer/forward.cu
++++ b/cuda_rasterizer/forward.cu
+@@ -475,7 +475,8 @@
+ 	 const float* __restrict__ bg_color,
+ 	 float* __restrict__ out_color,
+ 	 float* __restrict__ out_others,
+-	 float* __restrict__ max_blending)
++	 float* __restrict__ max_blending,
++	 float* __restrict__ sum_blending)
+  {
+ 	 // Identify current tile and associated min/max pixel range.
+ 	 auto block = cg::this_thread_block();
+@@ -604,6 +605,8 @@
+ 			 float blending_weight = alpha * T;
+ 			 // Update the maximum blending weight in a thread-safe way
+ 			 atomicMax(((int*)max_blending) + j_id, *((int*)(&blending_weight)));
++			 // Integrated contribution: the same weight summed over pixels.
++			 atomicAdd(sum_blending + j_id, blending_weight);
+ 
+ 			 float A = 1-T;
+ 			 float m = far_n / (far_n - near_n) * (1 - near_n / collected_depths[j]);
+@@ -709,7 +712,8 @@
+ 	 const float* bg_color,
+ 	 float* out_color,
+ 	 float* out_others,
+-	float* max_blending)
++	float* max_blending,
++	float* sum_blending)
+  {
+ 	 renderCUDA<NUM_CHANNELS> << <grid, block >> > (
+ 		 ranges,
+@@ -730,7 +734,8 @@
+ 		 bg_color,
+ 		 out_color,
+ 		 out_others,
+-		 max_blending
++		 max_blending,
++		 sum_blending
+ 		 );
+  }
+ 
+diff --git a/cuda_rasterizer/forward.h b/cuda_rasterizer/forward.h
+index 1b02791..416d79f 100644
+--- a/cuda_rasterizer/forward.h
++++ b/cuda_rasterizer/forward.h
+@@ -92,7 +92,8 @@
+ 		 const float* bg_color,
+ 		 float* out_color,
+ 		 float* out_others, 
+-		 float* max_blending);
++		 float* max_blending,
++		 float* sum_blending);
+  }
+  
+  
+diff --git a/cuda_rasterizer/rasterizer.h b/cuda_rasterizer/rasterizer.h
+index 7060057..cec44be 100644
+--- a/cuda_rasterizer/rasterizer.h
++++ b/cuda_rasterizer/rasterizer.h
+@@ -62,6 +62,7 @@ namespace CudaRasterizer
+ 			float* out_color,
+ 			float* out_others,
+ 			float* max_blending,
++			float* sum_blending,
+ 			int* radii = nullptr,
+ 			bool debug = false);
+ 
+diff --git a/cuda_rasterizer/rasterizer_impl.cu b/cuda_rasterizer/rasterizer_impl.cu
+index 4cb495a..7ab443e 100644
+--- a/cuda_rasterizer/rasterizer_impl.cu
++++ b/cuda_rasterizer/rasterizer_impl.cu
+@@ -236,6 +236,7 @@
+ 	 float* out_color,
+ 	 float* out_others,
+ 	 float* max_blending,
++	 float* sum_blending,
+ 	 int* radii,
+ 	 bool debug)
+  {
+@@ -381,7 +382,8 @@
+ 		 background,
+ 		 out_color,
+ 		 out_others,
+-		 max_blending), debug)
++		 max_blending,
++		 sum_blending), debug)
+  
+ 	 return num_rendered;
+  }
+diff --git a/diff_triangle_rasterization/__init__.py b/diff_triangle_rasterization/__init__.py
+index 6bde47e..32a18e2 100644
+--- a/diff_triangle_rasterization/__init__.py
++++ b/diff_triangle_rasterization/__init__.py
+@@ -89,23 +89,24 @@ class _RasterizeTriangles(torch.autograd.Function):
+         if raster_settings.debug:
+             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
+             try:
+-                num_rendered, color, depth, radii, geomBuffer, binningBuffer, imgBuffer, scaling, max_blending = _C.rasterize_triangles(*args)
++                num_rendered, color, depth, radii, geomBuffer, binningBuffer, imgBuffer, scaling, max_blending, sum_blending = _C.rasterize_triangles(*args)
+             except Exception as ex:
+                 torch.save(cpu_args, "snapshot_fw.dump")
+                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
+                 raise ex
+         else:
+-            num_rendered, color, depth, radii, geomBuffer, binningBuffer, imgBuffer, scaling, max_blending = _C.rasterize_triangles(*args)
++            num_rendered, color, depth, radii, geomBuffer, binningBuffer, imgBuffer, scaling, max_blending, sum_blending = _C.rasterize_triangles(*args)
+ 
+         # Keep relevant tensors for backward
+         ctx.raster_settings = raster_settings
+         ctx.num_rendered = num_rendered
+         ctx.sigma = sigma
+         ctx.save_for_backward(vertices, triangles_indices, vertex_weights, colors_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer)
+-        return color, radii, scaling, depth, max_blending
++        ctx.mark_non_differentiable(max_blending, sum_blending)
++        return color, radii, scaling, depth, max_blending, sum_blending
+ 
+     @staticmethod
+-    def backward(ctx, grad_out_color, _, __, grad_depth, _____,):
++    def backward(ctx, grad_out_color, _, __, grad_depth, _____, ______):
+ 
+         # Restore necessary values from context
+         num_rendered = ctx.num_rendered
+diff --git a/rasterize_points.cu b/rasterize_points.cu
+index c415c50..bec1374 100644
+--- a/rasterize_points.cu
++++ b/rasterize_points.cu
+@@ -45,7 +45,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
+     return lambda;
+ }
+ 
+-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
++std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+ RasterizetrianglesCUDA(
+ 	const torch::Tensor& background,
+ 	const torch::Tensor& vertices,
+@@ -92,6 +92,7 @@ RasterizetrianglesCUDA(
+ 
+   torch::Tensor out_others = torch::full({3+3+1, H, W}, 0.0, float_opts);
+   torch::Tensor max_blending = torch::full({P}, 0.0, float_opts);
++  torch::Tensor sum_blending = torch::full({P}, 0.0, float_opts);
+ 
+   const int total_nb_points = P * 3; // FOR EACH TRIANGLE, WE CAN HAVE 3 NORMALS, OFFSETS,...
+   
+@@ -128,10 +129,11 @@ RasterizetrianglesCUDA(
+ 		out_color.contiguous().data_ptr<float>(),
+ 		out_others.contiguous().data_ptr<float>(),
+ 		max_blending.contiguous().data_ptr<float>(),
++		sum_blending.contiguous().data_ptr<float>(),
+ 		radii.contiguous().data_ptr<int>(),
+ 		debug);
+   }
+-  return std::make_tuple(rendered, out_color, out_others, radii, geomBuffer, binningBuffer, imgBuffer, scaling, max_blending);
++  return std::make_tuple(rendered, out_color, out_others, radii, geomBuffer, binningBuffer, imgBuffer, scaling, max_blending, sum_blending);
+ }
+ 
+ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+diff --git a/rasterize_points.h b/rasterize_points.h
+index 494fc16..c83cb58 100644
+--- a/rasterize_points.h
++++ b/rasterize_points.h
+@@ -26,7 +26,7 @@
+  #include <tuple>
+  #include <string>
+ 	
+-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
++std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+ RasterizetrianglesCUDA(
+ 	const torch::Tensor& background,
+ 	const torch::Tensor& vertices,
+-- 
+2.34.1
+

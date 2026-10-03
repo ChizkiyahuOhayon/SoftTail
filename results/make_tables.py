@@ -119,6 +119,40 @@ def ablation_table(ablation):
     return lines
 
 
+TSPLUS_GROUPS = (("Mip-NeRF\\,360", ("bicycle", "flowers", "garden", "stump", "treehill",
+                                     "room", "counter", "kitchen", "bonsai")),
+                 ("Tanks\\,\\&\\,Temples", ("train", "truck")),
+                 ("Deep Blending", ("drjohnson", "playroom")))
+
+
+def tsplus_table(table, size):
+    """Triangle Splatting+ with and without the integrated survival rule."""
+    lines = [r"\begin{tabular}{l cccc r}", r"\toprule",
+             r" & PSNR & SSIM & LPIPS & Tri. (M) & $\Delta$PSNR \\"]
+    for name, scenes in TSPLUS_GROUPS:
+        lines += [r"\midrule", rf"\multicolumn{{6}}{{l}}{{\textit{{{name}}}}} \\"]
+        for arm, label in (("tsplus", "TS+"), ("tsplus_int", "+ integral")):
+            m = {k: sum(table[s][arm][k] for s in scenes) / len(scenes) for k in ("psnr", "ssim", "lpips")}
+            tri = sum(size[s][arm]["triangles"] for s in scenes) / len(scenes) / 1e6
+            delta = "--" if arm == "tsplus" else f"{m['psnr'] - sum(table[s]['tsplus']['psnr'] for s in scenes) / len(scenes):+.2f}"
+            lines.append(f"{label} & {m['psnr']:.2f} & {m['ssim']:.3f} & {m['lpips']:.3f} & {tri:.2f} & {delta} \\\\")
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    return lines
+
+
+def compact_table(rows):
+    """Compact meshes: the same mesh cut by the peak rule and by the integral."""
+    scenes = ("bicycle", "garden", "stump", "room")
+    lines = [r"\begin{tabular}{l c cccc}", r"\toprule",
+             "Budget & Rule & " + " & ".join(s.capitalize() for s in scenes) + r" \\", r"\midrule"]
+    for b in ("b10", "b25", "b50", "b75"):
+        for rule in ("peak", "integral"):
+            cells = " & ".join(f"{rows[s][b][rule]['psnr']:.2f}" for s in scenes)
+            lines.append(f"{b[1:] + chr(92) + '%' if rule == 'peak' else ''} & {rule} & {cells} \\\\")
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    return lines
+
+
 def main():
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--out", default=str(ROOT / "tables.tex"))
@@ -141,6 +175,14 @@ def main():
     if ablation_path.is_file():
         lines.append("")
         lines += ablation_table(load(ablation_path.name))
+
+    if (EVIDENCE / "tsplus_integrated_survival_table.json").is_file():
+        lines.append("")
+        lines += tsplus_table(load("tsplus_integrated_survival_table.json")["rows"],
+                              load("tsplus_integrated_survival_size.json")["rows"])
+    if (EVIDENCE / "softtail_compact_frontier.json").is_file():
+        lines.append("")
+        lines += compact_table(load("softtail_compact_frontier.json")["rows"])
 
     out = Path(args.out)
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")

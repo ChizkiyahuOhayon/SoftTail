@@ -1,0 +1,189 @@
+From 02c431f7504731699bbf6f05c50141056f77b87e Mon Sep 17 00:00:00 2001
+From: Zhao Liu <128977742+ChizkiyahuOhayon@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 19:22:09 -0700
+Subject: [PATCH] Integrated-contribution survival for Triangle Splatting+
+ (--integrated_importance)
+
+---
+ arguments/__init__.py         |  4 ++++
+ scene/triangle_model.py       | 10 +++++++++-
+ train.py                      | 20 ++++++++++++++++++++
+ triangle_renderer/__init__.py |  3 ++-
+ 4 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/arguments/__init__.py b/arguments/__init__.py
+index 109899d..edc3087 100644
+--- a/arguments/__init__.py
++++ b/arguments/__init__.py
+@@ -122,6 +122,10 @@ class OptimizationParams(ParamGroup):
+         self.start_opacity_floor = 5000
+ 
+         self.start_pruning = 4000
++        # Rank faces by integrated contribution sum(alpha*T) instead of the
++        # per-pixel peak when pruning, densifying and cleaning up. The peak
++        # rule still decides how many faces go; this only changes which.
++        self.integrated_importance = False
+         self.sigma_until = 30000
+         self.final_opacity_iter = 24000
+ 
+diff --git a/scene/triangle_model.py b/scene/triangle_model.py
+index f70a240..afe4629 100644
+--- a/scene/triangle_model.py
++++ b/scene/triangle_model.py
+@@ -69,6 +69,8 @@ class TriangleModel:
+         self.optimizer = None
+         self.image_size = 0
+         self.importance_score = 0
++        self.integrated_score = 0
++        self.integrated_importance = False
+         self.add_percentage = 1.0
+ 
+         self.scaling = 1
+@@ -150,6 +152,7 @@ class TriangleModel:
+ 
+         self.image_size = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
+         self.importance_score = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
++        self.integrated_score = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
+ 
+ 
+     def capture(self):
+@@ -274,6 +277,7 @@ class TriangleModel:
+ 
+         self.image_size = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
+         self.importance_score = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
++        self.integrated_score = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
+         
+ 
+     def training_setup(self, training_args, lr_mask, lr_features, weight_lr, lr_sigma, lr_triangles_init):
+@@ -393,6 +397,7 @@ class TriangleModel:
+ 
+         self.image_size = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
+         self.importance_score = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
++        self.integrated_score = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
+ 
+ 
+ 
+@@ -523,6 +528,8 @@ class TriangleModel:
+                 self.image_size = self.image_size[valid_tris]
+             if isinstance(self.importance_score, torch.Tensor) and self.importance_score.numel() > 0:
+                 self.importance_score = self.importance_score[valid_tris]
++            if isinstance(self.integrated_score, torch.Tensor) and self.integrated_score.numel() > 0:
++                self.integrated_score = self.integrated_score[valid_tris]
+ 
+         # Prune vertex-related parameters using the initial mask
+         self._prune_vertex_optimizer(vertex_mask)
+@@ -568,6 +575,7 @@ class TriangleModel:
+ 
+         self.image_size = self.image_size[mask]
+         self.importance_score = self.importance_score[mask]
++        self.integrated_score = self.integrated_score[mask]
+         
+ 
+     def _sample_alives(self, probs, num, alive_indices=None):
+@@ -588,7 +596,7 @@ class TriangleModel:
+             return 0
+ 
+         # Find indexes based on proba
+-        triangle_transp = self.importance_score
++        triangle_transp = self.integrated_score if self.integrated_importance else self.importance_score
+         probs = triangle_transp.squeeze()
+ 
+         areas = self.triangle_areas().squeeze()
+diff --git a/train.py b/train.py
+index 449fc1f..8a1acd4 100644
+--- a/train.py
++++ b/train.py
+@@ -40,6 +40,16 @@ import lpips
+ import torch.nn.functional as F
+ 
+ 
++def budget_matched_delete(peak_delete, integrated):
++    """Delete as many faces as the peak rule would, chosen by lowest integral."""
++    cut = int(peak_delete.sum())
++    delete = torch.zeros_like(peak_delete)
++    if cut > 0:
++        order = torch.sort(integrated, stable=True).indices
++        delete[order[:cut]] = True
++    return delete
++
++
+ def training(
+         dataset,   
+         opt, 
+@@ -54,6 +64,7 @@ def training(
+ 
+     # Load parameters, triangles and scene
+     triangles = TriangleModel(dataset.sh_degree)
++    triangles.integrated_importance = opt.integrated_importance
+     scene = Scene(dataset, triangles, opt.set_weight, opt.set_sigma)
+     triangles.training_setup(opt, opt.feature_lr, opt.weight_lr, opt.lr_triangles_points_init)
+     triangles.add_percentage = opt.add_percentage
+@@ -130,6 +141,7 @@ def training(
+             if len(scene.getTrainCameras()) + iteration == opt.iterations:
+                 print(iteration)
+                 triangles.importance_score = torch.zeros((triangles._triangle_indices.shape[0]), dtype=torch.float, device="cuda") # reset to 0 to ensure that everything is deleted with an importance score of 0
++                triangles.integrated_score = torch.zeros((triangles._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
+         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+ 
+         render_pkg = render(viewpoint_cam, triangles, pipe, bg)
+@@ -151,6 +163,8 @@ def training(
+         importance_score = render_pkg["max_blending"].detach()
+         mask = importance_score > triangles.importance_score
+         triangles.importance_score[mask] = importance_score[mask]
++        if opt.integrated_importance:
++            triangles.integrated_score += render_pkg["sum_blending"].detach()
+ 
+         loss_image = (1.0 - opt.lambda_dssim) * pixel_loss + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+ 
+@@ -201,6 +215,8 @@ def training(
+ 
+                 mask_opacity     = (min_weights <= prune_triangles).squeeze()              # delete if too low
+                 mask_importance  = (triangles.importance_score <= prune_triangles).squeeze()  # delete if too low
++                if opt.integrated_importance:
++                    mask_importance = budget_matched_delete(mask_importance, triangles.integrated_score.squeeze())
+                 mask_size        = (triangles.image_size > prune_size).squeeze()                 # delete if too big
+ 
+                 delete_mask = mask_opacity | mask_importance | mask_size
+@@ -274,6 +290,7 @@ def training(
+     # cleaning of triangles that we do not need
+     viewpoint_stack = scene.getTrainCameras().copy()
+     triangles.importance_score = torch.zeros((triangles._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
++    triangles.integrated_score = torch.zeros((triangles._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
+     while viewpoint_stack:
+         viewpoint_cam = viewpoint_stack.pop(0)
+         render_pkg = render(viewpoint_cam, triangles, pipe, bg)
+@@ -281,7 +298,10 @@ def training(
+         importance_score = render_pkg["max_blending"].detach()
+         mask = importance_score > triangles.importance_score
+         triangles.importance_score[mask] = importance_score[mask]
++        triangles.integrated_score += render_pkg["sum_blending"].detach()
+     mask_importance  = (triangles.importance_score <= 0.5).squeeze() 
++    if opt.integrated_importance:
++        mask_importance = budget_matched_delete(mask_importance, triangles.integrated_score.squeeze())
+     triangles.prune_triangles(~mask_importance) # delete all the remaining triangles that do not have an influence
+ 
+     scene.save(iteration)          
+diff --git a/triangle_renderer/__init__.py b/triangle_renderer/__init__.py
+index 9341833..6ff9b53 100644
+--- a/triangle_renderer/__init__.py
++++ b/triangle_renderer/__init__.py
+@@ -90,7 +90,7 @@ def render(viewpoint_camera, pc : TriangleModel, pipe, bg_color : torch.Tensor,
+         colors_precomp = override_color
+ 
+     # Rasterize visible triangles to image, obtain their radii (on screen). 
+-    rendered_image, radii, scaling, allmap, max_blending  = rasterizer(
++    rendered_image, radii, scaling, allmap, max_blending, sum_blending = rasterizer(
+         vertices=vertices,
+         triangles_indices=triangles_indices,
+         vertex_weights=vertex_weights.squeeze(),
+@@ -110,6 +110,7 @@ def render(viewpoint_camera, pc : TriangleModel, pipe, bg_color : torch.Tensor,
+             "radii": radii, 
+             "scaling": scaling,
+             "max_blending": max_blending,
++            "sum_blending": sum_blending,
+             }
+ 
+     # additional regularizations
+-- 
+2.34.1
+

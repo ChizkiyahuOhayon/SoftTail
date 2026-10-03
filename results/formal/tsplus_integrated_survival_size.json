@@ -1,0 +1,135 @@
+{
+  "experiment": "tsplus-integrated-survival-size",
+  "rows": {
+    "bicycle": {
+      "tsplus": {
+        "triangles": 1126241,
+        "train_seconds": 3072
+      },
+      "tsplus_int": {
+        "triangles": 800618,
+        "train_seconds": 2911
+      }
+    },
+    "bonsai": {
+      "tsplus": {
+        "triangles": 1490817,
+        "train_seconds": 2357
+      },
+      "tsplus_int": {
+        "triangles": 1387497,
+        "train_seconds": 2065
+      }
+    },
+    "counter": {
+      "tsplus": {
+        "triangles": 1529087,
+        "train_seconds": 2355
+      },
+      "tsplus_int": {
+        "triangles": 1324549,
+        "train_seconds": 2148
+      }
+    },
+    "drjohnson": {
+      "tsplus": {
+        "triangles": 1585274,
+        "train_seconds": 2242
+      },
+      "tsplus_int": {
+        "triangles": 1399057,
+        "train_seconds": 3283
+      }
+    },
+    "flowers": {
+      "tsplus": {
+        "triangles": 1118365,
+        "train_seconds": 1536
+      },
+      "tsplus_int": {
+        "triangles": 813537,
+        "train_seconds": 1362
+      }
+    },
+    "garden": {
+      "tsplus": {
+        "triangles": 976106,
+        "train_seconds": 1702
+      },
+      "tsplus_int": {
+        "triangles": 787045,
+        "train_seconds": 1654
+      }
+    },
+    "kitchen": {
+      "tsplus": {
+        "triangles": 1623127,
+        "train_seconds": 2406
+      },
+      "tsplus_int": {
+        "triangles": 1341151,
+        "train_seconds": 2218
+      }
+    },
+    "playroom": {
+      "tsplus": {
+        "triangles": 1578003,
+        "train_seconds": 3274
+      },
+      "tsplus_int": {
+        "triangles": 1452094,
+        "train_seconds": 3061
+      }
+    },
+    "room": {
+      "tsplus": {
+        "triangles": 1459434,
+        "train_seconds": 2464
+      },
+      "tsplus_int": {
+        "triangles": 1324065,
+        "train_seconds": 2093
+      }
+    },
+    "stump": {
+      "tsplus": {
+        "triangles": 1164422,
+        "train_seconds": 1909
+      },
+      "tsplus_int": {
+        "triangles": 923610,
+        "train_seconds": 1420
+      }
+    },
+    "train": {
+      "tsplus": {
+        "triangles": 891210,
+        "train_seconds": 1231
+      },
+      "tsplus_int": {
+        "triangles": 564954,
+        "train_seconds": 1137
+      }
+    },
+    "treehill": {
+      "tsplus": {
+        "triangles": 1152431,
+        "train_seconds": 1485
+      },
+      "tsplus_int": {
+        "triangles": 883597,
+        "train_seconds": 1343
+      }
+    },
+    "truck": {
+      "tsplus": {
+        "triangles": 791930,
+        "train_seconds": 1157
+      },
+      "tsplus_int": {
+        "triangles": 509429,
+        "train_seconds": 1092
+      }
+    }
+  }
+}

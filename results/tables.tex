@@ -44,3 +44,36 @@ peak & integral & 25.643 & 0.7708 & 0.2670 & +0.037 \\
 peak & random & 23.786 & 0.6932 & 0.3326 & -1.821 \\
 \bottomrule
 \end{tabular}
+
+\begin{tabular}{l cccc r}
+\toprule
+ & PSNR & SSIM & LPIPS & Tri. (M) & $\Delta$PSNR \\
+\midrule
+\multicolumn{6}{l}{\textit{Mip-NeRF\,360}} \\
+TS+ & 25.20 & 0.750 & 0.291 & 1.29 & -- \\
++ integral & 25.54 & 0.760 & 0.272 & 1.07 & +0.34 \\
+\midrule
+\multicolumn{6}{l}{\textit{Tanks\,\&\,Temples}} \\
+TS+ & 20.74 & 0.769 & 0.252 & 0.84 & -- \\
++ integral & 20.81 & 0.771 & 0.241 & 0.54 & +0.08 \\
+\midrule
+\multicolumn{6}{l}{\textit{Deep Blending}} \\
+TS+ & 27.88 & 0.858 & 0.317 & 1.58 & -- \\
++ integral & 28.38 & 0.862 & 0.291 & 1.43 & +0.50 \\
+\bottomrule
+\end{tabular}
+
+\begin{tabular}{l c cccc}
+\toprule
+Budget & Rule & Bicycle & Garden & Stump & Room \\
+\midrule
+10\% & peak & 12.39 & 16.35 & 15.42 & 17.19 \\
+ & integral & 19.83 & 20.05 & 20.90 & 23.07 \\
+25\% & peak & 20.02 & 22.55 & 22.39 & 24.96 \\
+ & integral & 22.72 & 24.04 & 24.30 & 27.50 \\
+50\% & peak & 22.95 & 24.83 & 24.96 & 28.62 \\
+ & integral & 23.27 & 24.94 & 25.18 & 28.68 \\
+75\% & peak & 23.32 & 25.00 & 25.28 & 28.79 \\
+ & integral & 23.33 & 25.03 & 25.29 & 28.83 \\
+\bottomrule
+\end{tabular}

@@ -100,7 +100,10 @@ deep_blending/
 | Baseline and opacity-floor rows | `scripts/run_scene.sh meshsplatting` / `opacity_floor` | `mipnerf360_main_table.json`, `tanks_and_temples_main_table.json`, `deep_blending_main_table.json` |
 | Terminal-opacity ablation and sensitivity | `sota/opacity_ablation.py`, `sota/opacity_sensitivity.py` | `opacity_ablation.json`, `opacity_sensitivity.json` |
 | Three-scene development runs | `scripts/run_scene.sh` on bicycle, garden, room | `softtail_integrated_importance_gate.json`, `softtail_integrated_importance_equal_budget.json`, `softtail_oats_integrated_survival_gate.json` |
-| Survival-statistic measurement (Fig. 3) | `python -m sota.survival_statistic` | `softtail_survival_statistic_{room,bicycle,garden}.json` |
+| Survival-statistic measurement | `python -m sota.survival_statistic` | `softtail_survival_statistic_{room,bicycle,garden}.json` |
+| Compact meshes (10/25/50/75% of the budget, 4 scenes) | `scripts/compact.sh` after `scripts/run_scene.sh softtail` | `softtail_compact_frontier.json` |
+| Survival rule inside Triangle Splatting+ (13 scenes) | `integrations/triangle_splatting_plus/run_tsplus.sh` | `tsplus_integrated_survival_table.json`, `tsplus_integrated_survival_size.json` |
+| Compact-cut renders and per-face light maps | `python -m sota.figure_renders compact` / `contrib` | figure inputs only |
 
 Regenerate the paper's tables from those files with:
 
@@ -108,6 +111,9 @@ Regenerate the paper's tables from those files with:
 shasum -a 256 -c results/SHA256SUMS
 python results/make_tables.py
 ```
+
+The compact-mesh and Triangle Splatting+ experiments ran on one RTX 4090 D;
+all other rows on one NVIDIA A40.
 
 Every formal launcher records the Git source revision. Each evaluation result
 records scene, arm, checkpoint size, triangle count, vertex count, PyTorch
@@ -120,13 +126,13 @@ Machine-readable results ship **inside this repository**, under
 which are about 8.9 GB for the 13 released scenes, live in the external bundle:
 
 ```text
-SoftTail Release/
-├── checkpoints/
-│   ├── softtail_bicycle.tar      # cfg_args, cameras.json,
-│   ├── ...                       # point_cloud/iteration_30000/
-│   └── softtail_playroom.tar
+SoftTail Release/                 https://drive.google.com/drive/folders/1Gj7ykZadiJ2IuTUrN046vAEGZMSnA_PY
 ├── README.md
-└── SHA256SUMS
+└── checkpoints/
+    ├── softtail_bicycle.tar      # cfg_args, cameras.json,
+    ├── ...                       # point_cloud/iteration_30000/
+    ├── softtail_playroom.tar
+    └── SHA256SUMS
 ```
 
 Build the archives with `bash sota/package_release.sh [destination]`; each one

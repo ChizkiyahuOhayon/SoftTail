@@ -1,0 +1,218 @@
+{
+  "experiment": "softtail-v3-figure-renders",
+  "script": "sota/figure_renders.py (v3_figures.sh)",
+  "rows": {
+    "bicycle": {
+      "contrib": {
+        "run": "/root/autodl-tmp/st3/runs/softtail__bicycle",
+        "view": "_DSC8760",
+        "faces": 10638607,
+        "kept": 5748781,
+        "swapped_each_way": 580635,
+        "pixel_weight_sum": {
+          "both": 1002297.625,
+          "peak_only": 1099.994384765625,
+          "integral_only": 8252.6376953125
+        },
+        "S_f_sum": {
+          "peak_only": 3201641.5,
+          "integral_only": 26347588.0
+        },
+        "view_ratio_integral_over_peak": 7.502436202954693
+      },
+      "compact_views": {
+        "10": {
+          "cut": "/root/autodl-tmp/st3/compact_01/bicycle/b10",
+          "views": [
+            "_DSC8832"
+          ],
+          "psnr": {
+            "_DSC8832": {
+              "peak": 12.007380485534668,
+              "integral": 19.69409942626953
+            }
+          },
+          "triangles": {
+            "peak": 574878,
+            "integral": 574878
+          }
+        },
+        "25": {
+          "cut": "/root/autodl-tmp/st3/compact_01/bicycle/b25",
+          "views": [
+            "_DSC8832"
+          ],
+          "psnr": {
+            "_DSC8832": {
+              "peak": 20.388248443603516,
+              "integral": 24.38406753540039
+            }
+          },
+          "triangles": {
+            "peak": 1437195,
+            "integral": 1437195
+          }
+        }
+      }
+    },
+    "garden": {
+      "contrib": {
+        "run": "/root/autodl-tmp/st3/runs/softtail__garden",
+        "view": "DSC08140",
+        "faces": 11781220,
+        "kept": 6563257,
+        "swapped_each_way": 627998,
+        "pixel_weight_sum": {
+          "both": 1072558.125,
+          "peak_only": 954.1901245117188,
+          "integral_only": 10797.3798828125
+        },
+        "S_f_sum": {
+          "peak_only": 2954821.0,
+          "integral_only": 24891152.0
+        },
+        "view_ratio_integral_over_peak": 11.31575312450207
+      },
+      "compact_views": {
+        "10": {
+          "cut": "/root/autodl-tmp/st3/compact_01/garden/b10",
+          "views": [
+            "DSC08140"
+          ],
+          "psnr": {
+            "DSC08140": {
+              "peak": 16.461042404174805,
+              "integral": 20.68109893798828
+            }
+          },
+          "triangles": {
+            "peak": 656325,
+            "integral": 656325
+          }
+        },
+        "25": {
+          "cut": "/root/autodl-tmp/st3/compact_01/garden/b25",
+          "views": [
+            "DSC08140"
+          ],
+          "psnr": {
+            "DSC08140": {
+              "peak": 23.351505279541016,
+              "integral": 25.18416404724121
+            }
+          },
+          "triangles": {
+            "peak": 1640814,
+            "integral": 1640814
+          }
+        }
+      }
+    },
+    "stump": {
+      "contrib": {
+        "run": "/root/autodl-tmp/st3/runs/softtail__stump",
+        "view": "_DSC9229",
+        "faces": 9285781,
+        "kept": 5287042,
+        "swapped_each_way": 512523,
+        "pixel_weight_sum": {
+          "both": 1006223.5,
+          "peak_only": 2754.85693359375,
+          "integral_only": 9670.3935546875
+        },
+        "S_f_sum": {
+          "peak_only": 2691546.75,
+          "integral_only": 18126158.0
+        },
+        "view_ratio_integral_over_peak": 3.5103069915403315
+      },
+      "compact_views": {
+        "10": {
+          "cut": "/root/autodl-tmp/st3/compact_01/stump/b10",
+          "views": [
+            "_DSC9261"
+          ],
+          "psnr": {
+            "_DSC9261": {
+              "peak": 16.635204315185547,
+              "integral": 22.6307373046875
+            }
+          },
+          "triangles": {
+            "peak": 528704,
+            "integral": 528704
+          }
+        },
+        "25": {
+          "cut": "/root/autodl-tmp/st3/compact_01/stump/b25",
+          "views": [
+            "_DSC9261"
+          ],
+          "psnr": {
+            "_DSC9261": {
+              "peak": 23.648677825927734,
+              "integral": 25.183834075927734
+            }
+          },
+          "triangles": {
+            "peak": 1321760,
+            "integral": 1321760
+          }
+        }
+      }
+    },
+    "room": {
+      "contrib": {
+        "run": "/root/autodl-tmp/st3/runs/softtail__room",
+        "view": "DSCF4691",
+        "faces": 11459462,
+        "kept": 5691658,
+        "swapped_each_way": 700456,
+        "pixel_weight_sum": {
+          "both": 1590523.5,
+          "peak_only": 1336.0576171875,
+          "integral_only": 19967.951171875
+        },
+        "S_f_sum": {
+          "peak_only": 8974464.0,
+          "integral_only": 95752368.0
+        },
+        "view_ratio_integral_over_peak": 14.94542669043646
+      },
+      "compact_views": {
+        "10": {
+          "cut": "/root/autodl-tmp/st3/compact_01/room/b10",
+          "views": [
+            "DSCF4667"
+          ],
+          "psnr": {
+            "DSCF4667": {
+              "peak": 17.231901168823242,
+              "integral": 23.900421142578125
+            }
+          },
+          "triangles": {
+            "peak": 569165,
+            "integral": 569165
+          }
+        },
+        "25": {
+          "cut": "/root/autodl-tmp/st3/compact_01/room/b25",
+          "views": [
+            "DSCF4667"
+          ],
+          "psnr": {
+            "DSCF4667": {
+              "peak": 24.946182250976562,
+              "integral": 27.728126525878906
+            }
+          },
+          "triangles": {
+            "peak": 1422914,
+            "integral": 1422914
+          }
+        }
+      }
+    }
+  }
+}
