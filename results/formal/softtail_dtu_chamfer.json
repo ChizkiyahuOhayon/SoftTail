@@ -1,0 +1,231 @@
+{
+  "experiment": "softtail-dtu-chamfer",
+  "protocol": "15 DTU scans, 2DGS-preprocessed images at half resolution (-r 1 on dtu_r2), 30k iterations, 2DGS mask culling (sota.dtu_cull), official evaluator (eval.py, seed 0); MeshSplatting reproduced with the official code (outdoor defaults, no depth prior); SoftTail = --final_opacity 0.8 --integrated_importance + survival cleanup (cut/oats)",
+  "scripts": "d1_par.sh (training, culling), d1_rescore.sh (evaluation)",
+  "rows": {
+    "scan105": {
+      "meshsplatting": {
+        "mean_d2s": 2.1029137323209084,
+        "mean_s2d": 0.37702787907463636,
+        "overall": 1.2399708056977723,
+        "seed": 0
+      },
+      "softtail": {
+        "mean_d2s": 2.093523464916823,
+        "mean_s2d": 0.3255219846270694,
+        "overall": 1.2095227247719462,
+        "seed": 0
+      }
+    },
+    "scan106": {
+      "meshsplatting": {
+        "mean_d2s": 2.7601957370076673,
+        "mean_s2d": 0.5103104620556104,
+        "overall": 1.6352530995316388,
+        "seed": 0
+      },
+      "softtail": {
+        "mean_d2s": 2.5348629653967873,
+        "mean_s2d": 0.47506043322386593,
+        "overall": 1.5049616993103268,
+        "seed": 0
+      }
+    },
+    "scan110": {
+      "meshsplatting": {
+        "mean_d2s": 3.5107146109671077,
+        "mean_s2d": 2.5390450507273483,
+        "overall": 3.024879830847228,
+        "seed": 0
+      },
+      "softtail": {
+        "mean_d2s": 3.471139445616491,
+        "mean_s2d": 1.5531451453850362,
+        "overall": 2.5121422955007633,
+        "seed": 0
+      }
+    },
+    "scan114": {
+      "meshsplatting": {
+        "mean_d2s": 2.5035616087857164,
+        "mean_s2d": 0.603971264266009,
+        "overall": 1.5537664365258628,
+        "seed": 0
+      },
+      "softtail": {
+        "mean_d2s": 2.2432112695467583,
+        "mean_s2d": 0.511072706139368,
+        "overall": 1.377141987843063,
+        "seed": 0
+      }
+    },
+    "scan118": {
+      "meshsplatting": {
+        "mean_d2s": 2.7500870171962757,
+        "mean_s2d": 0.502991951587331,
+        "overall": 1.6265394843918033,
+        "seed": 0
+      },
+      "softtail": {
+        "mean_d2s": 2.6369294201934634,
+        "mean_s2d": 0.4617091915326985,
+        "overall": 1.549319305863081,
+        "seed": 0
+      }
+    },
+    "scan122": {
+      "meshsplatting": {
+        "mean_d2s": 2.7407051111588028,
+        "mean_s2d": 0.47174390473631767,
+        "overall": 1.60622450794756,
+        "seed": 0
+      },
+      "softtail": {
+        "mean_d2s": 2.5468248544026135,
+        "mean_s2d": 0.43684805096103996,
+        "overall": 1.4918364526818269,
+        "seed": 0
+      }
+    },
+    "scan24": {
+      "meshsplatting": {
+        "mean_d2s": 2.004198682077641,
+        "mean_s2d": 0.45969970072945526,
+        "overall": 1.2319491914035483,
+        "seed": 0
+      },
+      "softtail": {
+        "mean_d2s": 2.248704179565296,
+        "mean_s2d": 0.4161266303281307,
+        "overall": 1.3324154049467134,
+        "seed": 0
+      }
+    },
+    "scan37": {
+      "meshsplatting": {
+        "mean_d2s": 2.097759674147979,
+        "mean_s2d": 0.46950254050268875,
+        "overall": 1.283631107325334,
+        "seed": 0
+      },
+      "softtail": {
+        "mean_d2s": 1.9544986310017585,
+        "mean_s2d": 0.45610983327436766,
+        "overall": 1.2053042321380631,
+        "seed": 0
+      }
+    },
+    "scan40": {
+      "meshsplatting": {
+        "mean_d2s": 2.5041684135917213,
+        "mean_s2d": 0.3780666345082607,
+        "overall": 1.441117524049991,
+        "seed": 0
+      },
+      "softtail": {
+        "mean_d2s": 2.494670053441314,
+        "mean_s2d": 0.3160697831381974,
+        "overall": 1.4053699182897559,
+        "seed": 0
+      }
+    },
+    "scan55": {
+      "meshsplatting": {
+        "mean_d2s": 2.571207980486271,
+        "mean_s2d": 0.3456291414023907,
+        "overall": 1.458418560944331,
+        "seed": 0
+      },
+      "softtail": {
+        "mean_d2s": 2.4149723940289807,
+        "mean_s2d": 0.33581882530570123,
+        "overall": 1.375395609667341,
+        "seed": 0
+      }
+    },
+    "scan63": {
+      "meshsplatting": {
+        "mean_d2s": 3.099502167481156,
+        "mean_s2d": 0.881813770908802,
+        "overall": 1.9906579691949788,
+        "seed": 0
+      },
+      "softtail": {
+        "mean_d2s": 2.93162458677346,
+        "mean_s2d": 0.6858719047270972,
+        "overall": 1.8087482457502786,
+        "seed": 0
+      }
+    },
+    "scan65": {
+      "meshsplatting": {
+        "mean_d2s": 2.5901872258835983,
+        "mean_s2d": 0.830223203624929,
+        "overall": 1.7102052147542637,
+        "seed": 0
+      },
+      "softtail": {
+        "mean_d2s": 2.552346247174692,
+        "mean_s2d": 0.7859624597609784,
+        "overall": 1.6691543534678353,
+        "seed": 0
+      }
+    },
+    "scan69": {
+      "meshsplatting": {
+        "mean_d2s": 2.580079554138124,
+        "mean_s2d": 0.8260240894097215,
+        "overall": 1.7030518217739226,
+        "seed": 0
+      },
+      "softtail": {
+        "mean_d2s": 2.419893751792023,
+        "mean_s2d": 0.7557892706842445,
+        "overall": 1.5878415112381337,
+        "seed": 0
+      }
+    },
+    "scan83": {
+      "meshsplatting": {
+        "mean_d2s": 2.3573274122183068,
+        "mean_s2d": 1.3976290731643917,
+        "overall": 1.8774782426913492,
+        "seed": 0
+      },
+      "softtail": {
+        "mean_d2s": 2.3042532656612393,
+        "mean_s2d": 1.3202061700379322,
+        "overall": 1.8122297178495859,
+        "seed": 0
+      }
+    },
+    "scan97": {
+      "meshsplatting": {
+        "mean_d2s": 2.090589813741227,
+        "mean_s2d": 1.0904749840275638,
+        "overall": 1.5905323988843953,
+        "seed": 0
+      },
+      "softtail": {
+        "mean_d2s": 2.093851374953632,
+        "mean_s2d": 1.0174260828753567,
+        "overall": 1.5556387289144944,
+        "seed": 0
+      }
+    }
+  },
+  "means": {
+    "meshsplatting": {
+      "mean_d2s": 2.550879916080167,
+      "mean_s2d": 0.7789435767150305,
+      "overall": 1.6649117463975986
+    },
+    "softtail": {
+      "mean_d2s": 2.4627537269643556,
+      "mean_s2d": 0.6568492314667389,
+      "overall": 1.5598014792155472
+    }
+  },
+  "softtail_wins_overall": 14,
+  "scans": 15
+}

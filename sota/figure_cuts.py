@@ -5,7 +5,7 @@ compact   Render test views of one compact cut (sota/survival_cleanup --budget):
           (matched/) and by the integral (matched_oats/), with the evaluator's
           SoftTail-Quality settings, next to the ground truth.
 
-              python -m sota.figure_renders compact -s <scene> -i images_4 --eval \
+              python -m sota.figure_cuts compact -s <scene> -i images_4 --eval \
                   -m <cut>/matched --cut <cut> --views auto --out <dir>
 
 contrib   Where the faces the two rules disagree on deliver light. On the saved
@@ -17,7 +17,7 @@ contrib   Where the faces the two rules disagree on deliver light. On the saved
           the summed blending weight sum_f w_f(p) of that class, the same quantity
           S_f integrates per face.
 
-              python -m sota.figure_renders contrib -s <scene> -i images_4 --eval \
+              python -m sota.figure_cuts contrib -s <scene> -i images_4 --eval \
                   -m <run> --view DSC08140 --out <dir>
 """
 

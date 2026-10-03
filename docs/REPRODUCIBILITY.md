@@ -103,7 +103,8 @@ deep_blending/
 | Survival-statistic measurement | `python -m sota.survival_statistic` | `softtail_survival_statistic_{room,bicycle,garden}.json` |
 | Compact meshes (10/25/50/75% of the budget, 4 scenes) | `scripts/compact.sh` after `scripts/run_scene.sh softtail` | `softtail_compact_frontier.json` |
 | Survival rule inside Triangle Splatting+ (13 scenes) | `integrations/triangle_splatting_plus/run_tsplus.sh` | `tsplus_integrated_survival_table.json`, `tsplus_integrated_survival_size.json` |
-| Compact-cut renders and per-face light maps | `python -m sota.figure_renders compact` / `contrib` | figure inputs only |
+| DTU Chamfer distance (15 scans, both arms) | `sota/run.sh <arm> scanN -r 1` on 2DGS-preprocessed DTU, `sota.survival_cleanup`, `sota.dtu_cull`, `eval.py` | `softtail_dtu_chamfer.json` |
+| Compact-cut renders and per-face light maps | `python -m sota.figure_cuts compact` / `contrib` | figure inputs only |
 
 Regenerate the paper's tables from those files with:
 

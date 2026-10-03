@@ -1,6 +1,6 @@
 {
   "experiment": "softtail-v3-figure-renders",
-  "script": "sota/figure_renders.py (v3_figures.sh)",
+  "script": "sota/figure_cuts.py (v3_figures.sh)",
   "rows": {
     "bicycle": {
       "contrib": {

@@ -52,6 +52,7 @@ lossless compositing tail. The rasterizer gains one `atomicAdd`.
 | **All 13 scenes improve** | +0.37 / +0.40 / +0.64 dB PSNR over MeshSplatting on Mip-NeRF 360 / Tanks & Temples / Deep Blending; best connected-mesh method on Mip-NeRF 360, best SSIM and LPIPS of all mesh methods there |
 | **Not capacity** | cut back to the control's exact face count, 9/9 scenes keep +0.19 of the +0.21 dB gain; re-picking the same number of faces at random costs −1.82 dB |
 | **Small budgets** | same trained mesh, same face count: **+3.7 to +7.4 dB** at 10% of the faces, +1.5 to +2.7 dB at 25%; at 50% it matches the full-size MeshSplatting mesh |
+| **Better geometry** | DTU, 15 scans, same protocol for both: mean Chamfer 1.665 → **1.560** (−6.3%), 14/15 scans better, accuracy and completeness both improve |
 | **Transfers** | inside Triangle Splatting+, the rule alone gives **+0.32 dB with 20% fewer triangles** over 13 scenes (25.54 dB on Mip-NeRF 360) |
 | **Cheap** | one float per triangle, one `atomicAdd`; no network, no new hyperparameter |
 | **Auditable** | every number is a JSON in [`results/formal/`](results/formal), hashed in [`results/SHA256SUMS`](results/SHA256SUMS); the paper tables are generated from them |
@@ -105,6 +106,24 @@ wins all 16 pairs on PSNR, SSIM and LPIPS; numbers in
 | Garden | 16.35 → **20.05** | 22.55 → **24.04** | 24.83 → **24.94** | 25.00 → **25.03** |
 | Stump | 15.42 → **20.90** | 22.39 → **24.30** | 24.96 → **25.18** | 25.28 → **25.29** |
 | Room | 17.19 → **23.07** | 24.96 → **27.50** | 28.62 → **28.68** | 28.79 → **28.83** |
+
+### Geometry on DTU
+
+<p align="center">
+  <img src="assets/dtu.png" width="100%" alt="Normals of all 15 DTU scans, MeshSplatting reproduction against SoftTail, with Chamfer distance">
+</p>
+
+Our MeshSplatting reproduction and SoftTail, both trained on the 2DGS-preprocessed scans at half
+resolution without a depth prior, culled with the 2DGS masks and scored with the official evaluator
+(lower is better). The reproduction does not reach the 0.79 reported by the MeshSplatting authors,
+whose DTU command is unpublished, so the comparison is paired under one protocol.
+
+| DTU, 15 scans | Chamfer ↓ | Accuracy ↓ | Completeness ↓ | Scans better |
+|---|---:|---:|---:|---:|
+| MeshSplatting (our reproduction) | 1.665 | 2.551 | 0.779 | — |
+| **SoftTail** | **1.560** | **2.463** | **0.657** | **14 / 15** |
+
+Per scan: [`results/formal/softtail_dtu_chamfer.json`](results/formal/softtail_dtu_chamfer.json).
 
 ### The rule inside Triangle Splatting+
 
@@ -285,7 +304,7 @@ bash integrations/triangle_splatting_plus/run_tsplus.sh /path/to/triangle-splatt
 | Tanks & Temples | `bash scripts/reproduce.sh tandt data/tandt runs/tandt` | ~12 h |
 | Deep Blending | `bash scripts/reproduce.sh deepblending data/db runs/db` | ~12 h |
 | LaTeX tables from our archived JSONs | `python results/make_tables.py` | none |
-| Figure renders (compact views, per-face light maps) | `python -m sota.figure_renders {compact,contrib} ...` (see its docstring) | minutes |
+| Figure renders (compact views, per-face light maps) | `python -m sota.figure_cuts {compact,contrib} ...` (see its docstring) | minutes |
 
 Every launcher is resumable. Compare your numbers with the per-scene rows in
 [`results/formal/`](results/formal).
@@ -301,7 +320,7 @@ SoftTail/
 │   ├── survival_cleanup.py        # offline final cleanup at any face budget (--budget)
 │   ├── main_table_eval.py         # frozen evaluator (stock / ours_quality / ours_speed)
 │   ├── survival_statistic.py      # peak vs. integral measurement
-│   └── figure_renders.py          # compact-cut renders and exact per-face light maps
+│   └── figure_cuts.py          # compact-cut renders and exact per-face light maps
 ├── integrations/
 │   └── triangle_splatting_plus/   # patch + launcher for Triangle Splatting+
 ├── submodules/                    # rasterizer with the S_f accumulator, simple-knn, rdel
